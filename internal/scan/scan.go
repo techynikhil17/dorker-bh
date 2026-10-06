@@ -27,11 +27,24 @@ func Synthesize(template, target string) string {
 }
 
 func scopedQuery(template, target string) string {
-	query := Synthesize(template, target)
-	for _, field := range strings.Fields(query) {
-		if strings.EqualFold(field, "site:"+target) {
-			return query
+	fields := strings.Fields(Synthesize(template, target))
+	queryFields := fields[:0]
+	hasTargetSite := false
+	for _, field := range fields {
+		if strings.EqualFold(field, target) {
+			continue
 		}
+		if strings.EqualFold(field, "site:"+target) {
+			hasTargetSite = true
+		}
+		queryFields = append(queryFields, field)
+	}
+	query := strings.Join(queryFields, " ")
+	if hasTargetSite {
+		return query
+	}
+	if query == "" {
+		return "site:" + target
 	}
 	return "site:" + target + " " + query
 }
@@ -384,11 +397,24 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 				// Deliberately independent of producer cancellation: finish in-flight work.
 				results, err := search(context.Background(), job.Engine, job.Query)
 				if err == nil {
+					inScope := 0
+					outOfScope := 0
 					for _, result := range results {
+						if !belongsToTarget(result, job.Target) {
+							outOfScope++
+							continue
+						}
+						inScope++
 						if writeErr := s.add(job, result); writeErr != nil {
 							err = writeErr
 							break
 						}
+					}
+					if err == nil && outOfScope > 0 && cfg.Verbose && !cfg.Silent {
+						fmt.Fprintf(cfg.Stderr, "dorker-bh: %s %s: ignored %d out-of-scope URLs\n", job.Engine, job.Target, outOfScope)
+					}
+					if err == nil && len(results) > 0 && inScope == 0 {
+						err = fmt.Errorf("provider returned %d URLs but none matched requested domain %s; %s may have ignored the target scope", outOfScope, job.Target, job.Engine)
 					}
 				}
 				if err == nil {

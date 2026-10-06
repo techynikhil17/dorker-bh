@@ -27,7 +27,7 @@ site:{target} inurl:admin
 site:%s ext:env
 ```
 
-If a template does not already contain `site:<target>`, the tool adds it to the search query. Regardless of what an engine returns, only URLs on the requested domain or its subdomains are written. Search engines can ignore operators or return unrelated results, so a query may yield no URLs after this check.
+The `{target}` or `%s` placeholder is treated as the domain scope, not as a required text term. If a template does not already contain `site:<target>`, the tool adds it to the search query. Regardless of what an engine returns, only URLs on the requested domain or its subdomains are written. Search engines can ignore operators or return unrelated results; if every result is outside the target, the job is reported as failed with that explanation.
 
 Flags: `-l/--list`, `-d/--dorks`, `-e/--engines` (default `duckduckgo,bing`), `-c/--concurrency` (default `10`), `-p/--proxies`, `-o/--output`, `--delay`, `--timeout` (default `10s`), `--retries` (default `3`), `--json`, `-s/--silent`, `-v/--verbose`, and `--resume`.
 

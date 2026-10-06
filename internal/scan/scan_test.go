@@ -43,11 +43,36 @@ func TestRunScopesQueriesAndResultsToTarget(t *testing.T) {
 	if err := Run(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
-	if query != "site:kohls.com kohls.com inurl:admin" {
+	if query != "site:kohls.com inurl:admin" {
 		t.Fatalf("unscoped query %q", query)
 	}
 	if got := stdout.String(); got != "https://www.kohls.com/admin\nhttps://kohls.com/login\n" {
 		t.Fatalf("out-of-scope results: %q", got)
+	}
+}
+
+func TestRunReportsWhenProviderReturnsOnlyOutOfScopeURLs(t *testing.T) {
+	dir := t.TempDir()
+	dorks := filepath.Join(dir, "dorks.txt")
+	if err := os.WriteFile(dorks, []byte("{target}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	cfg := Config{Dorks: dorks, Engines: "bing", Concurrency: 1, Timeout: time.Second,
+		Stdin: strings.NewReader("kohls.com\n"), Stdout: &stdout, Stderr: &stderr,
+		Search: func(context.Context, string, string) ([]string, error) {
+			return []string{"https://www.microsoft.com/help", "https://www.zhihu.com/question"}, nil
+		},
+	}
+	err := Run(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "1 search jobs failed") {
+		t.Fatalf("expected the all-out-of-scope provider response to fail, got %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("out-of-scope URLs were printed: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "none matched requested domain") {
+		t.Fatalf("missing actionable scope diagnostic: %q", stderr.String())
 	}
 }
 
@@ -57,8 +82,20 @@ func TestScopedQueryPreservesSiteOperator(t *testing.T) {
 	}
 }
 
+func TestScopedQueryDropsStandaloneTargetSearchTerm(t *testing.T) {
+	for _, template := range []string{"{target}", "%s", "{target} inurl:admin", "site:{target}"} {
+		got := scopedQuery(template, "kohls.com")
+		if strings.Contains(got, "site:kohls.com kohls.com") || got == "kohls.com" {
+			t.Errorf("target was still searched as a required text term for %q: %q", template, got)
+		}
+	}
+	if got := scopedQuery("{target} inurl:admin", "kohls.com"); got != "site:kohls.com inurl:admin" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestScopedQueryAddsTargetWhenTemplateNamesAnotherSite(t *testing.T) {
-	if got := scopedQuery("site:other.example {target}", "kohls.com"); got != "site:kohls.com site:other.example kohls.com" {
+	if got := scopedQuery("site:other.example {target}", "kohls.com"); got != "site:kohls.com site:other.example" {
 		t.Fatalf("query was not scoped to target: %q", got)
 	}
 }
