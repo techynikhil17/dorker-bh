@@ -163,3 +163,18 @@ func TestBingSearchFormChallengeIsError(t *testing.T) {
 		t.Fatal("Bing challenge was treated as a successful empty result set")
 	}
 }
+
+func TestYahooMobileRedirectDecoding(t *testing.T) {
+	body := `<div class="dd algo"><a href="https://r.search.yahoo.com/_ylt=x/RU=https%3a%2f%2fexample.com%2fadmin%3fx%3d1/RK=2/RS=x">Admin</a></div><a href="https://search.yahoo.com/help">Help</a>`
+	got, err := ParseResults("yahoo", strings.NewReader(body))
+	if err != nil || len(got) != 1 || got[0] != "https://example.com/admin?x=1" {
+		t.Fatalf("got %#v err=%v", got, err)
+	}
+}
+
+func TestYandexRobotChallenge(t *testing.T) {
+	_, err := ParseResults("yandex", strings.NewReader(`<title>Are you not a robot?</title>`))
+	if err == nil {
+		t.Fatal("challenge accepted")
+	}
+}

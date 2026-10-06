@@ -114,6 +114,10 @@ func endpoint(engine, query string) (string, error) {
 		return "https://www.bing.com/search?q=" + q, nil
 	case "google":
 		return "https://www.google.com/search?q=" + q + "&num=100", nil
+	case "yahoo":
+		return "https://search.yahoo.com/mobile/s?p=" + q, nil
+	case "yandex":
+		return "https://yandex.com/search/?text=" + q, nil
 	default:
 		return "", fmt.Errorf("unsupported engine %q", engine)
 	}
@@ -136,7 +140,11 @@ func (c *Client) Search(ctx context.Context, engine, query string) ([]string, er
 	if err != nil {
 		return nil, err
 	}
-	return c.searchAt(ctx, engine, address)
+	results, err := c.searchAt(ctx, engine, address)
+	if engine == "duckduckgo" && err != nil {
+		return c.searchAt(ctx, engine, "https://lite.duckduckgo.com/lite/?q="+url.QueryEscape(query))
+	}
+	return results, err
 }
 
 func (c *Client) searchAt(ctx context.Context, engine, address string) ([]string, error) {
@@ -222,8 +230,8 @@ func (c *Client) fetchWithUA(ctx context.Context, address, userAgent string) (*b
 // known result redirects. It deliberately does not follow arbitrary redirects.
 func ParseResults(engine string, body io.Reader) ([]string, error) {
 	type frame struct {
-		tag, href                     string
-		ad, bingResult, googleHeading bool
+		tag, href                                                string
+		ad, bingResult, yahooResult, yandexResult, googleHeading bool
 	}
 	var stack []frame
 	var out []string
@@ -249,7 +257,7 @@ func ParseResults(engine string, body io.Reader) ([]string, error) {
 		switch tt {
 		case html.TextToken:
 			text := strings.ToLower(string(z.Text()))
-			if strings.Contains(text, "captcha") || strings.Contains(text, "unusual traffic") || strings.Contains(text, "verify you are human") || strings.Contains(text, "please solve the challenge") {
+			if strings.Contains(text, "captcha") || strings.Contains(text, "unusual traffic") || strings.Contains(text, "verify you are human") || strings.Contains(text, "please solve the challenge") || strings.Contains(text, "are you not a robot") {
 				challenge = true
 			}
 		case html.StartTagToken, html.SelfClosingTagToken:
@@ -258,6 +266,8 @@ func ParseResults(engine string, body io.Reader) ([]string, error) {
 			if len(stack) > 0 {
 				f.ad = stack[len(stack)-1].ad
 				f.bingResult = stack[len(stack)-1].bingResult
+				f.yahooResult = stack[len(stack)-1].yahooResult
+				f.yandexResult = stack[len(stack)-1].yandexResult
 			}
 			var class string
 			for _, a := range token.Attr {
@@ -280,6 +290,12 @@ func ParseResults(engine string, body io.Reader) ([]string, error) {
 			if strings.Contains(" "+class+" ", " b_algo ") {
 				f.bingResult = true
 			}
+			if strings.Contains(lower, " algo") || strings.Contains(lower, "algo ") {
+				f.yahooResult = true
+			}
+			if strings.Contains(lower, "organic") {
+				f.yandexResult = true
+			}
 			if token.Data == "h3" {
 				for i := len(stack) - 1; i >= 0; i-- {
 					if stack[i].tag == "a" {
@@ -293,6 +309,12 @@ func ParseResults(engine string, body io.Reader) ([]string, error) {
 					add(f.href)
 				}
 				if engine == "bing" && f.bingResult {
+					add(f.href)
+				}
+				if engine == "yahoo" && f.yahooResult {
+					add(f.href)
+				}
+				if engine == "yandex" && f.yandexResult {
 					add(f.href)
 				}
 			}
@@ -371,6 +393,21 @@ func destination(engine, raw string) string {
 		}
 		host = strings.ToLower(u.Hostname())
 	}
+	if engine == "yahoo" && (host == "yahoo.com" || strings.HasSuffix(host, ".yahoo.com")) {
+		if start := strings.Index(u.EscapedPath(), "/RU="); start >= 0 {
+			part := u.EscapedPath()[start+4:]
+			if end := strings.Index(part, "/RK="); end >= 0 {
+				part = part[:end]
+			}
+			if decoded, decErr := url.PathUnescape(part); decErr == nil {
+				u, err = url.Parse(decoded)
+				if err != nil {
+					return ""
+				}
+				host = strings.ToLower(u.Hostname())
+			}
+		}
+	}
 	if engine == "bing" {
 		// Bing adds this per-search tracking token to otherwise stable URLs.
 		query := u.Query()
@@ -388,7 +425,7 @@ func destination(engine, raw string) string {
 	if isGoogleHost(host) {
 		return ""
 	}
-	for _, self := range []string{"duckduckgo.com", "bing.com", "google.com", "googleadservices.com", "doubleclick.net"} {
+	for _, self := range []string{"duckduckgo.com", "bing.com", "google.com", "googleadservices.com", "doubleclick.net", "yahoo.com", "yandex.com", "yandex.ru"} {
 		if host == self || strings.HasSuffix(host, "."+self) {
 			return ""
 		}
