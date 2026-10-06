@@ -23,16 +23,17 @@ import (
 
 // Client fetches public HTML results from the selected search engines.
 type Client struct {
-	timeout                   time.Duration
-	retries                   int
-	proxies                   []*url.URL
-	next                      atomic.Uint64
-	mu                        sync.Mutex
-	clients                   map[string]*http.Client
-	commonCrawlIndex          string
-	commonCrawlMu             sync.Mutex
-	lastCommonCrawl           time.Time
-	googleAPIKey, googleCSEID string
+	timeout                    time.Duration
+	retries                    int
+	proxies                    []*url.URL
+	next                       atomic.Uint64
+	mu                         sync.Mutex
+	clients                    map[string]*http.Client
+	commonCrawlIndex           string
+	commonCrawlMu              sync.Mutex
+	lastCommonCrawl            time.Time
+	googleAPIKey, googleCSEID  string
+	serpAPIKey, serpAPIBaseURL string
 }
 
 type statusError struct{ Code int }
@@ -58,7 +59,7 @@ func releaseBody(body *bytes.Buffer) {
 }
 
 func NewClient(timeout time.Duration, retries int, rawProxies []string) (*Client, error) {
-	c := &Client{timeout: timeout, retries: retries, clients: make(map[string]*http.Client), googleAPIKey: os.Getenv("DORKER_GOOGLE_API_KEY"), googleCSEID: os.Getenv("DORKER_GOOGLE_CSE_ID")}
+	c := &Client{timeout: timeout, retries: retries, clients: make(map[string]*http.Client), googleAPIKey: os.Getenv("DORKER_GOOGLE_API_KEY"), googleCSEID: os.Getenv("DORKER_GOOGLE_CSE_ID"), serpAPIKey: os.Getenv("DORKER_SERPAPI_KEY"), serpAPIBaseURL: "https://serpapi.com/search.json"}
 	for _, raw := range rawProxies {
 		u, err := url.Parse(raw)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" && u.Scheme != "socks5h") {
@@ -121,6 +122,9 @@ func endpoint(engine, query string) (string, error) {
 func (c *Client) Search(ctx context.Context, engine, query string) ([]string, error) {
 	if engine == "wayback" || engine == "commoncrawl" {
 		return c.searchArchive(ctx, engine, query)
+	}
+	if engine == "bing" && c.serpAPIKey != "" {
+		return c.searchBingSerpAPI(ctx, query)
 	}
 	if engine == "google" && (c.googleAPIKey != "" || c.googleCSEID != "") {
 		if c.googleAPIKey == "" || c.googleCSEID == "" {
@@ -366,6 +370,14 @@ func destination(engine, raw string) string {
 			return ""
 		}
 		host = strings.ToLower(u.Hostname())
+	}
+	if engine == "bing" {
+		// Bing adds this per-search tracking token to otherwise stable URLs.
+		query := u.Query()
+		if query.Has("msockid") {
+			query.Del("msockid")
+			u.RawQuery = query.Encode()
+		}
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return ""
