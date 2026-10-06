@@ -1,7 +1,9 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -9,32 +11,54 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/html"
+	"golang.org/x/net/publicsuffix"
 )
 
 // Client fetches public HTML results from the selected search engines.
 type Client struct {
-	timeout time.Duration
-	retries int
-	proxies []*url.URL
-	next    atomic.Uint64
-	mu      sync.Mutex
-	clients map[string]*http.Client
+	timeout                   time.Duration
+	retries                   int
+	proxies                   []*url.URL
+	next                      atomic.Uint64
+	mu                        sync.Mutex
+	clients                   map[string]*http.Client
+	commonCrawlIndex          string
+	commonCrawlMu             sync.Mutex
+	lastCommonCrawl           time.Time
+	googleAPIKey, googleCSEID string
 }
 
+type statusError struct{ Code int }
+
+func (e statusError) Error() string { return fmt.Sprintf("provider returned HTTP %d", e.Code) }
+
 var userAgents = []string{
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:127.0) Gecko/20100101 Firefox/127.0",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 15.0; rv:154.0) Gecko/20100101 Firefox/154.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15",
+}
+
+var bodyPool = sync.Pool{New: func() any { return bytes.NewBuffer(make([]byte, 0, 64<<10)) }}
+
+func releaseBody(body *bytes.Buffer) {
+	if body == nil {
+		return
+	}
+	body.Reset()
+	if body.Cap() <= 512<<10 {
+		bodyPool.Put(body)
+	}
 }
 
 func NewClient(timeout time.Duration, retries int, rawProxies []string) (*Client, error) {
-	c := &Client{timeout: timeout, retries: retries, clients: make(map[string]*http.Client)}
+	c := &Client{timeout: timeout, retries: retries, clients: make(map[string]*http.Client), googleAPIKey: os.Getenv("DORKER_GOOGLE_API_KEY"), googleCSEID: os.Getenv("DORKER_GOOGLE_CSE_ID")}
 	for _, raw := range rawProxies {
 		u, err := url.Parse(raw)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" && u.Scheme != "socks5h") {
@@ -95,6 +119,15 @@ func endpoint(engine, query string) (string, error) {
 }
 
 func (c *Client) Search(ctx context.Context, engine, query string) ([]string, error) {
+	if engine == "wayback" || engine == "commoncrawl" {
+		return c.searchArchive(ctx, engine, query)
+	}
+	if engine == "google" && (c.googleAPIKey != "" || c.googleCSEID != "") {
+		if c.googleAPIKey == "" || c.googleCSEID == "" {
+			return nil, errors.New("Google API requires both DORKER_GOOGLE_API_KEY and DORKER_GOOGLE_CSE_ID")
+		}
+		return c.searchGoogleAPI(ctx, query)
+	}
 	address, err := endpoint(engine, query)
 	if err != nil {
 		return nil, err
@@ -103,30 +136,64 @@ func (c *Client) Search(ctx context.Context, engine, query string) ([]string, er
 }
 
 func (c *Client) searchAt(ctx context.Context, engine, address string) ([]string, error) {
+	body, err := c.fetch(ctx, address)
+	var status statusError
+	if engine == "duckduckgo" && errors.As(err, &status) && status.Code == http.StatusAccepted {
+		// DuckDuckGo occasionally challenges browser-like header sets with 202.
+		// Its HTML endpoint also accepts a minimal compatibility UA.
+		body, err = c.fetchWithUA(ctx, address, "Mozilla/5.0")
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer releaseBody(body)
+	return ParseResults(engine, bytes.NewReader(body.Bytes()))
+}
+
+func (c *Client) fetch(ctx context.Context, address string) (*bytes.Buffer, error) {
+	return c.fetchWithUA(ctx, address, "")
+}
+
+func (c *Client) fetchWithUA(ctx context.Context, address, userAgent string) (*bytes.Buffer, error) {
 	for attempt := 0; attempt <= c.retries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
-		req.Header.Set("Accept", "text/html,application/xhtml+xml")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		ua := userAgent
+		if ua == "" {
+			ua = userAgents[rand.Intn(len(userAgents))]
+		}
+		req.Header.Set("User-Agent", ua)
+		if userAgent == "" {
+			req.Header.Set("Accept", "text/html,application/xhtml+xml")
+			req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		}
 		resp, err := c.httpClient(c.proxy()).Do(req)
 		retry := err != nil && ctx.Err() == nil
 		if err == nil {
 			if resp.StatusCode == http.StatusOK {
-				results, parseErr := ParseResults(engine, io.LimitReader(resp.Body, 4<<20))
+				// Reject oversized pages instead of silently checkpointing partial data.
+				body := bodyPool.Get().(*bytes.Buffer)
+				body.Reset()
+				count, readErr := io.CopyN(body, resp.Body, (2<<20)+1)
 				closeErr := resp.Body.Close()
-				if parseErr != nil {
-					return nil, parseErr
+				if readErr != nil && !errors.Is(readErr, io.EOF) {
+					releaseBody(body)
+					return nil, readErr
+				}
+				if count > 2<<20 {
+					releaseBody(body)
+					return nil, errors.New("provider response exceeds 2 MiB")
 				}
 				if closeErr != nil {
+					releaseBody(body)
 					return nil, closeErr
 				}
-				return results, nil
+				return body, nil
 			}
-			retry = resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable
-			err = fmt.Errorf("%s returned HTTP %d", engine, resp.StatusCode)
+			retry = resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout
+			err = statusError{Code: resp.StatusCode}
 			resp.Body.Close()
 		}
 		if !retry || attempt == c.retries {
@@ -147,76 +214,102 @@ func (c *Client) searchAt(ctx context.Context, engine, address string) ([]string
 // ParseResults accepts links only in engine result containers, then unwraps
 // known result redirects. It deliberately does not follow arbitrary redirects.
 func ParseResults(engine string, body io.Reader) ([]string, error) {
-	root, err := html.Parse(body)
-	if err != nil {
-		return nil, err
+	type frame struct {
+		tag, href                     string
+		ad, bingResult, googleHeading bool
 	}
-	seen := make(map[string]struct{})
+	var stack []frame
 	var out []string
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "a" && isResult(engine, n) && !isAd(n) {
-			if dest := destination(engine, attr(n, "href")); dest != "" {
-				if _, exists := seen[dest]; !exists {
-					seen[dest] = struct{}{}
-					out = append(out, dest)
+	seen := make(map[string]struct{})
+	challenge := false
+	add := func(raw string) {
+		if dest := destination(engine, raw); dest != "" {
+			if _, exists := seen[dest]; !exists {
+				seen[dest] = struct{}{}
+				out = append(out, dest)
+			}
+		}
+	}
+	z := html.NewTokenizer(body)
+	for {
+		tt := z.Next()
+		if tt == html.ErrorToken {
+			if err := z.Err(); err != nil && err != io.EOF {
+				return nil, err
+			}
+			break
+		}
+		switch tt {
+		case html.TextToken:
+			text := strings.ToLower(string(z.Text()))
+			if strings.Contains(text, "captcha") || strings.Contains(text, "unusual traffic") || strings.Contains(text, "verify you are human") {
+				challenge = true
+			}
+		case html.StartTagToken, html.SelfClosingTagToken:
+			token := z.Token()
+			f := frame{tag: token.Data}
+			if len(stack) > 0 {
+				f.ad = stack[len(stack)-1].ad
+				f.bingResult = stack[len(stack)-1].bingResult
+			}
+			var class string
+			for _, a := range token.Attr {
+				switch a.Key {
+				case "href":
+					f.href = a.Val
+				case "class", "id":
+					class += " " + a.Val
+				}
+				if strings.Contains(strings.ToLower(a.Val), "/httpservice/retry/enablejs") {
+					challenge = true
+				}
+			}
+			lower := strings.ToLower(class)
+			for _, marker := range []string{"result--ad", "b_ad", "ads-ad", "ueierd"} {
+				if strings.Contains(lower, marker) {
+					f.ad = true
+				}
+			}
+			if strings.Contains(" "+class+" ", " b_algo ") {
+				f.bingResult = true
+			}
+			if token.Data == "h3" {
+				for i := len(stack) - 1; i >= 0; i-- {
+					if stack[i].tag == "a" {
+						stack[i].googleHeading = true
+						break
+					}
+				}
+			}
+			if token.Data == "a" && !f.ad {
+				if engine == "duckduckgo" && strings.Contains(" "+class+" ", " result__a ") {
+					add(f.href)
+				}
+				if engine == "bing" && f.bingResult {
+					add(f.href)
+				}
+			}
+			if tt == html.StartTagToken {
+				stack = append(stack, f)
+			}
+		case html.EndTagToken:
+			tag, _ := z.TagName()
+			for i := len(stack) - 1; i >= 0; i-- {
+				f := stack[i]
+				if f.tag == "a" && engine == "google" && f.googleHeading && !f.ad {
+					add(f.href)
+				}
+				stack = stack[:i]
+				if f.tag == string(tag) {
+					break
 				}
 			}
 		}
-		for child := n.FirstChild; child != nil; child = child.NextSibling {
-			walk(child)
-		}
 	}
-	walk(root)
+	if challenge && len(out) == 0 {
+		return nil, errors.New("search engine returned a bot challenge")
+	}
 	return out, nil
-}
-
-func attr(n *html.Node, key string) string {
-	for _, a := range n.Attr {
-		if a.Key == key {
-			return a.Val
-		}
-	}
-	return ""
-}
-
-func hasClass(n *html.Node, class string) bool {
-	for _, word := range strings.Fields(attr(n, "class")) {
-		if word == class {
-			return true
-		}
-	}
-	return false
-}
-
-func isResult(engine string, n *html.Node) bool {
-	switch engine {
-	case "duckduckgo":
-		return hasClass(n, "result__a")
-	case "bing":
-		for p := n.Parent; p != nil; p = p.Parent {
-			if hasClass(p, "b_algo") {
-				return true
-			}
-		}
-	case "google":
-		for child := n.FirstChild; child != nil; child = child.NextSibling {
-			if child.Type == html.ElementNode && child.Data == "h3" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isAd(n *html.Node) bool {
-	for p := n; p != nil; p = p.Parent {
-		v := strings.ToLower(attr(p, "class") + " " + attr(p, "id"))
-		if strings.Contains(v, "result--ad") || strings.Contains(v, "b_ad") || strings.Contains(v, "ads-ad") || strings.Contains(v, "ueierd") {
-			return true
-		}
-	}
-	return false
 }
 
 func destination(engine, raw string) string {
@@ -238,6 +331,19 @@ func destination(engine, raw string) string {
 		}
 	}
 	host := strings.ToLower(u.Hostname())
+	if engine == "bing" && (host == "bing.com" || strings.HasSuffix(host, ".bing.com")) && u.Path == "/ck/a" {
+		encoded := u.Query().Get("u")
+		if strings.HasPrefix(encoded, "a1") {
+			decoded, decodeErr := base64.RawURLEncoding.DecodeString(strings.TrimRight(encoded[2:], "="))
+			if decodeErr == nil {
+				u, err = url.Parse(string(decoded))
+				if err != nil {
+					return ""
+				}
+				host = strings.ToLower(u.Hostname())
+			}
+		}
+	}
 	if engine == "duckduckgo" && (host == "duckduckgo.com" || strings.HasSuffix(host, ".duckduckgo.com")) {
 		if value := u.Query().Get("uddg"); value != "" {
 			u, err = url.Parse(value)
@@ -247,7 +353,7 @@ func destination(engine, raw string) string {
 			host = strings.ToLower(u.Hostname())
 		}
 	}
-	if engine == "google" && (host == "google.com" || strings.HasSuffix(host, ".google.com")) && u.Path == "/url" {
+	if engine == "google" && isGoogleHost(host) && u.Path == "/url" {
 		value := u.Query().Get("q")
 		if value == "" {
 			return ""
@@ -264,6 +370,9 @@ func destination(engine, raw string) string {
 	if host == "" || net.ParseIP(host) == nil && strings.ContainsAny(host, " \t\r\n") {
 		return ""
 	}
+	if isGoogleHost(host) {
+		return ""
+	}
 	for _, self := range []string{"duckduckgo.com", "bing.com", "google.com", "googleadservices.com", "doubleclick.net"} {
 		if host == self || strings.HasSuffix(host, "."+self) {
 			return ""
@@ -271,4 +380,9 @@ func destination(engine, raw string) string {
 	}
 	u.Fragment = ""
 	return u.String()
+}
+
+func isGoogleHost(host string) bool {
+	base, err := publicsuffix.EffectiveTLDPlusOne(host)
+	return err == nil && strings.HasPrefix(base, "google.")
 }

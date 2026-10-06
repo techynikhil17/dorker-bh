@@ -25,6 +25,8 @@ func Synthesize(template, target string) string {
 	return strings.Join(strings.Fields(strings.ReplaceAll(strings.ReplaceAll(template, "{target}", target), "%s", target)), " ")
 }
 
+func passive(engine string) bool { return engine == "wayback" || engine == "commoncrawl" }
+
 type Job struct{ Target, Engine, Query, ID string }
 type Record struct {
 	URL       string `json:"url"`
@@ -38,6 +40,7 @@ type Config struct {
 	Concurrency, Retries                          int
 	Delay, Timeout                                time.Duration
 	JSON, Silent, Verbose                         bool
+	AutoResume                                    bool
 	Stdin                                         io.Reader
 	Stdout, Stderr                                io.Writer
 	Search                                        func(context.Context, string, string) ([]string, error)
@@ -50,6 +53,7 @@ type state struct {
 	output                *bufio.Writer
 	file                  *os.File
 	checkpoint            *os.File
+	checkpointWriter      *bufio.Writer
 	json, silent, verbose bool
 	stdout, stderr        io.Writer
 	failures              int
@@ -129,15 +133,7 @@ func (s *state) finish(job Job) error {
 	if _, exists := s.completed[job.ID]; exists {
 		return nil
 	}
-	if s.file != nil {
-		if err := s.file.Sync(); err != nil {
-			return err
-		}
-	}
-	if _, err := fmt.Fprintln(s.checkpoint, job.ID); err != nil {
-		return err
-	}
-	if err := s.checkpoint.Sync(); err != nil {
+	if _, err := fmt.Fprintln(s.checkpointWriter, job.ID); err != nil {
 		return err
 	}
 	s.completed[job.ID] = struct{}{}
@@ -162,10 +158,27 @@ func (s *state) failed(job Job, err error) {
 
 func openState(cfg Config) (*state, error) {
 	s := &state{seen: make(map[string]struct{}), completed: make(map[string]struct{}), json: cfg.JSON, silent: cfg.Silent, verbose: cfg.Verbose, stdout: cfg.Stdout, stderr: cfg.Stderr}
+	resumeExisting := false
+	if cfg.Resume != "" {
+		if cfg.Resume == cfg.Output {
+			return nil, errors.New("resume and output paths must differ")
+		}
+		_, err := os.Stat(cfg.Resume)
+		if err == nil {
+			resumeExisting = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
 	if cfg.Output != "" {
+		if resumeExisting {
+			if _, err := os.Stat(cfg.Output); err != nil {
+				return nil, fmt.Errorf("resuming requires existing output file %q: %w", cfg.Output, err)
+			}
+		}
 		// Resume appends; fresh scans truncate to avoid mixing two result sets.
 		flag := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
-		if cfg.Resume != "" {
+		if resumeExisting {
 			flag = os.O_CREATE | os.O_WRONLY | os.O_APPEND
 		}
 		f, err := os.OpenFile(cfg.Output, flag, 0644)
@@ -174,7 +187,7 @@ func openState(cfg Config) (*state, error) {
 		}
 		s.file = f
 		s.output = bufio.NewWriterSize(f, 64*1024)
-		if cfg.Resume != "" {
+		if resumeExisting {
 			old, err := os.Open(cfg.Output)
 			if err == nil {
 				readErr := readLines(old, func(line string) error {
@@ -215,6 +228,7 @@ func openState(cfg Config) (*state, error) {
 			return nil, err
 		}
 		s.checkpoint = f
+		s.checkpointWriter = bufio.NewWriterSize(f, 64*1024)
 	}
 	return s, nil
 }
@@ -225,9 +239,12 @@ func (s *state) close() error {
 		errs = append(errs, s.output.Flush())
 	}
 	if s.file != nil {
+		errs = append(errs, s.file.Sync())
 		errs = append(errs, s.file.Close())
 	}
 	if s.checkpoint != nil {
+		errs = append(errs, s.checkpointWriter.Flush())
+		errs = append(errs, s.checkpoint.Sync())
 		errs = append(errs, s.checkpoint.Close())
 	}
 	return errors.Join(errs...)
@@ -258,7 +275,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	for i, engine := range engines {
 		engine = strings.ToLower(strings.TrimSpace(engine))
 		engines[i] = engine
-		if engine != "duckduckgo" && engine != "bing" && engine != "google" {
+		if engine != "duckduckgo" && engine != "bing" && engine != "google" && !passive(engine) {
 			return fmt.Errorf("unsupported engine %q", engine)
 		}
 	}
@@ -290,7 +307,12 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	if err != nil {
 		return err
 	}
-	defer func() { runErr = errors.Join(runErr, s.close()) }()
+	defer func() {
+		runErr = errors.Join(runErr, s.close())
+		if runErr == nil && cfg.AutoResume && cfg.Resume != "" {
+			runErr = os.Remove(cfg.Resume)
+		}
+	}()
 
 	var input io.Reader = cfg.Stdin
 	if cfg.List != "" {
@@ -304,6 +326,12 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	if input == nil {
 		return errors.New("provide -l/--list or pipe targets to stdin")
 	}
+	stopInput := context.AfterFunc(ctx, func() {
+		if closer, ok := input.(io.Closer); ok {
+			closer.Close()
+		}
+	})
+	defer stopInput()
 	jobs := make(chan Job, cfg.Concurrency*2)
 	var workers sync.WaitGroup
 	for i := 0; i < cfg.Concurrency; i++ {
@@ -362,18 +390,33 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 		if !ValidTarget(target) {
 			return fmt.Errorf("invalid target %q", target)
 		}
+		queue := func(engine, query string) error {
+			job := Job{Target: target, Engine: engine, Query: query, ID: jobID(engine, query)}
+			if s.isCompleted(job.ID) {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case jobs <- job:
+				produced++
+				return nil
+			}
+		}
 		for _, template := range templates {
 			for _, engine := range engines {
-				query := Synthesize(template, target)
-				job := Job{Target: target, Engine: engine, Query: query, ID: jobID(engine, query)}
-				if s.isCompleted(job.ID) {
+				if passive(engine) {
 					continue
 				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case jobs <- job:
-					produced++
+				if err := queue(engine, Synthesize(template, target)); err != nil {
+					return err
+				}
+			}
+		}
+		for _, engine := range engines {
+			if passive(engine) {
+				if err := queue(engine, target); err != nil {
+					return err
 				}
 			}
 		}
@@ -381,6 +424,9 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	})
 	close(jobs)
 	workers.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if readErr != nil && !errors.Is(readErr, context.Canceled) {
 		return readErr
 	}

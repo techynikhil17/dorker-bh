@@ -2,3 +2,4 @@
 /dorker-bh.exe
 /dist/
 *.test
+.dorker-bh.resume

@@ -21,8 +21,8 @@ func run() int {
 	flag.StringVar(&cfg.List, "list", "", "file containing target domains")
 	flag.StringVar(&cfg.Dorks, "d", "", "file containing dork templates")
 	flag.StringVar(&cfg.Dorks, "dorks", "", "file containing dork templates")
-	flag.StringVar(&cfg.Engines, "e", "duckduckgo", "comma-separated search engines: duckduckgo,bing,google")
-	flag.StringVar(&cfg.Engines, "engines", "duckduckgo", "comma-separated search engines")
+	flag.StringVar(&cfg.Engines, "e", "duckduckgo,bing", "comma-separated providers: duckduckgo,bing,google,wayback,commoncrawl")
+	flag.StringVar(&cfg.Engines, "engines", "duckduckgo,bing", "comma-separated providers")
 	flag.IntVar(&cfg.Concurrency, "c", 10, "worker count")
 	flag.IntVar(&cfg.Concurrency, "concurrency", 10, "worker count")
 	flag.StringVar(&cfg.Proxies, "p", "", "HTTP/HTTPS/SOCKS5 proxy file")
@@ -37,7 +37,7 @@ func run() int {
 	flag.BoolVar(&cfg.Silent, "silent", false, "print URLs only, suppress operational logs")
 	flag.BoolVar(&cfg.Verbose, "v", false, "log queries and errors to stderr")
 	flag.BoolVar(&cfg.Verbose, "verbose", false, "log queries and errors to stderr")
-	flag.StringVar(&cfg.Resume, "resume", "", "checkpoint file; append output and skip completed queries")
+	flag.StringVar(&cfg.Resume, "resume", ".dorker-bh.resume", "checkpoint file (empty disables checkpointing)")
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "dorker-bh: search engine reconnaissance for authorized targets")
 		fmt.Fprintln(flag.CommandLine.Output(), "Usage: dorker-bh -l targets.txt -d dorks.txt [flags]")
@@ -45,6 +45,12 @@ func run() int {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	cfg.AutoResume = true
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "resume" {
+			cfg.AutoResume = false
+		}
+	})
 	cfg.Stdout, cfg.Stderr = os.Stdout, os.Stderr
 	if cfg.List == "" {
 		info, err := os.Stdin.Stat()
