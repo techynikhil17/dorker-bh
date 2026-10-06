@@ -28,7 +28,7 @@ func TestRunScopesQueriesAndResultsToTarget(t *testing.T) {
 	}
 	var stdout bytes.Buffer
 	var query string
-	cfg := Config{Dorks: dorks, Engines: "bing", Concurrency: 1, Timeout: time.Second,
+	cfg := Config{Dorks: dorks, Engines: "bing", Concurrency: 1, Timeout: time.Second, IncludeSubdomains: true,
 		Stdin: strings.NewReader("kohls.com\n"), Stdout: &stdout, Stderr: io.Discard,
 		Search: func(_ context.Context, _, q string) ([]string, error) {
 			query = q
@@ -46,8 +46,48 @@ func TestRunScopesQueriesAndResultsToTarget(t *testing.T) {
 	if query != "site:kohls.com inurl:admin" {
 		t.Fatalf("unscoped query %q", query)
 	}
-	if got := stdout.String(); got != "https://www.kohls.com/admin\nhttps://kohls.com/login\n" {
+	if got := stdout.String(); got != "https://kohls.com/login\nhttps://www.kohls.com/admin\n" {
 		t.Fatalf("out-of-scope results: %q", got)
+	}
+}
+
+func TestBroadCollectorRunsOnceAndFiltersLocally(t *testing.T) {
+	dir := t.TempDir()
+	dorks := filepath.Join(dir, "dorks.txt")
+	os.WriteFile(dorks, []byte("site:{target} inurl:admin\nsite:{target} inurl:login\n"), 0600)
+	var calls atomic.Int32
+	var stdout bytes.Buffer
+	cfg := Config{Dorks: dorks, Engines: "yahoo", Concurrency: 2, Timeout: time.Second, Stdin: strings.NewReader("example.com\n"), Stdout: &stdout, Stderr: io.Discard, Search: func(_ context.Context, engine, q string) ([]string, error) {
+		calls.Add(1)
+		if engine != "yahoo" || q != "site:example.com" {
+			t.Fatalf("%s %s", engine, q)
+		}
+		return []string{"https://example.com/admin", "https://example.com/other"}, nil
+	}}
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 || stdout.String() != "https://example.com/admin\n" {
+		t.Fatalf("calls=%d out=%q", calls.Load(), stdout.String())
+	}
+}
+
+func TestPartialProviderFailureStillReturnsResults(t *testing.T) {
+	dir := t.TempDir()
+	dorks := filepath.Join(dir, "dorks.txt")
+	os.WriteFile(dorks, []byte("site:{target}\n"), 0600)
+	var stdout bytes.Buffer
+	cfg := Config{Dorks: dorks, Engines: "duckduckgo,yahoo", Concurrency: 2, Timeout: time.Second, Stdin: strings.NewReader("example.com\n"), Stdout: &stdout, Stderr: io.Discard, Search: func(_ context.Context, e, q string) ([]string, error) {
+		if e == "duckduckgo" {
+			return nil, errors.New("challenge")
+		}
+		return []string{"https://example.com/"}, nil
+	}}
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "https://example.com/\n" {
+		t.Fatalf("%q", stdout.String())
 	}
 }
 

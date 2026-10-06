@@ -178,3 +178,10 @@ func TestYandexRobotChallenge(t *testing.T) {
 		t.Fatal("challenge accepted")
 	}
 }
+
+func TestYahooEndpointUsesBroadSiteQuery(t *testing.T) {
+	got, err := endpoint("yahoo", "site:example.com")
+	if err != nil || !strings.Contains(got, "p=site%3Aexample.com") {
+		t.Fatalf("%s %v", got, err)
+	}
+}

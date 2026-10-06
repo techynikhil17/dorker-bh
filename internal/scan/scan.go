@@ -12,10 +12,14 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/techynikhil17/dorker-bh/internal/crawl"
+	"github.com/techynikhil17/dorker-bh/internal/discovery"
+	dorkfilter "github.com/techynikhil17/dorker-bh/internal/filter"
 	"github.com/techynikhil17/dorker-bh/internal/provider"
 )
 
@@ -59,25 +63,38 @@ func belongsToTarget(rawURL, target string) bool {
 	return host == target || strings.HasSuffix(host, "."+target)
 }
 
-func passive(engine string) bool { return engine == "wayback" || engine == "commoncrawl" }
+func passive(engine string) bool {
+	return engine == "wayback" || engine == "commoncrawl" || engine == "yahoo"
+}
 
 type Job struct{ Target, Engine, Query, ID string }
 type Record struct {
-	URL       string `json:"url"`
-	Domain    string `json:"domain"`
-	Engine    string `json:"engine"`
-	Query     string `json:"query"`
-	Timestamp string `json:"timestamp"`
+	URL         string   `json:"url"`
+	Domain      string   `json:"domain"`
+	Engine      string   `json:"engine"`
+	Query       string   `json:"query"`
+	Timestamp   string   `json:"timestamp"`
+	Sources     []string `json:"sources,omitempty"`
+	Verified    bool     `json:"verified"`
+	StatusCode  int      `json:"status_code,omitempty"`
+	ContentType string   `json:"content_type,omitempty"`
+	Depth       int      `json:"depth,omitempty"`
+	FilterState string   `json:"filter_state,omitempty"`
 }
 type Config struct {
-	List, Dorks, Engines, Proxies, Output, Resume string
-	Concurrency, Retries                          int
-	Delay, Timeout                                time.Duration
-	JSON, Silent, Verbose                         bool
-	AutoResume                                    bool
-	Stdin                                         io.Reader
-	Stdout, Stderr                                io.Writer
-	Search                                        func(context.Context, string, string) ([]string, error)
+	List, Dorks, Engines, Proxies, Output, Resume             string
+	Concurrency, Retries                                      int
+	Delay, Timeout                                            time.Duration
+	JSON, Silent, Verbose                                     bool
+	IncludeSubdomains, AllowPrivate, IncludeUnverifiedFilters bool
+	CrawlDepth, CrawlRequests, CrawlConcurrency               int
+	CrawlDuration, CrawlDelay                                 time.Duration
+	CrawlResponseBytes                                        int64
+	AutoResume                                                bool
+	Stdin                                                     io.Reader
+	Stdout, Stderr                                            io.Writer
+	Search                                                    func(context.Context, string, string) ([]string, error)
+	Crawl                                                     func(context.Context, discovery.Scope, []string, crawl.Config) ([]discovery.Observation, crawl.Stats, error)
 }
 
 type state struct {
@@ -157,6 +174,49 @@ func (s *state) add(job Job, rawURL string) error {
 		return err
 	}
 	s.seen[rawURL] = struct{}{}
+	s.count++
+	return nil
+}
+
+func (s *state) addObservation(obs discovery.Observation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.seen[obs.URL]; exists {
+		return nil
+	}
+	engine := "local"
+	if len(obs.Sources) == 1 {
+		engine = obs.Sources[0]
+	}
+	query := ""
+	if len(obs.Queries) > 0 {
+		query = obs.Queries[0]
+	}
+	record := Record{URL: obs.URL, Domain: obs.Target, Engine: engine, Query: query, Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Sources: obs.Sources, Verified: obs.Verified, StatusCode: obs.StatusCode, ContentType: obs.ContentType, Depth: obs.Depth, FilterState: obs.FilterState}
+	line := obs.URL
+	if s.json {
+		data, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		line = string(data)
+	}
+	if s.file != nil {
+		if _, err := s.output.WriteString(line + "\n"); err != nil {
+			return err
+		}
+		if err := s.output.Flush(); err != nil {
+			return err
+		}
+	}
+	stdoutLine := line
+	if s.silent {
+		stdoutLine = obs.URL
+	}
+	if _, err := fmt.Fprintln(s.stdout, stdoutLine); err != nil {
+		return err
+	}
+	s.seen[obs.URL] = struct{}{}
 	s.count++
 	return nil
 }
@@ -312,7 +372,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	for i, engine := range engines {
 		engine = strings.ToLower(strings.TrimSpace(engine))
 		engines[i] = engine
-		if engine != "duckduckgo" && engine != "bing" && engine != "google" && !passive(engine) {
+		if engine != "duckduckgo" && engine != "bing" && engine != "google" && engine != "yandex" && engine != "crawl" && !passive(engine) {
 			return fmt.Errorf("unsupported engine %q", engine)
 		}
 	}
@@ -333,6 +393,25 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	search := cfg.Search
 	if search == nil {
 		search = client.Search
+	}
+	crawlRun := cfg.Crawl
+	if crawlRun == nil {
+		crawlRun = crawl.Run
+	}
+	if cfg.CrawlDepth == 0 {
+		cfg.CrawlDepth = 2
+	}
+	if cfg.CrawlRequests == 0 {
+		cfg.CrawlRequests = 1000
+	}
+	if cfg.CrawlDuration == 0 {
+		cfg.CrawlDuration = 10 * time.Minute
+	}
+	if cfg.CrawlResponseBytes == 0 {
+		cfg.CrawlResponseBytes = 5 << 20
+	}
+	if cfg.CrawlConcurrency == 0 {
+		cfg.CrawlConcurrency = 5
 	}
 	if cfg.Stdout == nil {
 		cfg.Stdout = os.Stdout
@@ -369,118 +448,160 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 		}
 	})
 	defer stopInput()
-	jobs := make(chan Job, cfg.Concurrency*2)
-	var workers sync.WaitGroup
-	for i := 0; i < cfg.Concurrency; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				var job Job
-				var ok bool
-				select {
-				case <-ctx.Done():
-					return
-				case job, ok = <-jobs:
-					if !ok {
-						return
-					}
-				}
-				if cfg.Verbose && !cfg.Silent {
-					fmt.Fprintf(cfg.Stderr, "dorker-bh: querying %s %q\n", job.Engine, job.Query)
-				}
-				// Deliberately independent of producer cancellation: finish in-flight work.
-				results, err := search(context.Background(), job.Engine, job.Query)
-				if err == nil {
-					inScope := 0
-					outOfScope := 0
-					for _, result := range results {
-						if !belongsToTarget(result, job.Target) {
-							outOfScope++
-							continue
-						}
-						inScope++
-						if writeErr := s.add(job, result); writeErr != nil {
-							err = writeErr
-							break
-						}
-					}
-					if err == nil && outOfScope > 0 && cfg.Verbose && !cfg.Silent {
-						fmt.Fprintf(cfg.Stderr, "dorker-bh: %s %s: ignored %d out-of-scope URLs\n", job.Engine, job.Target, outOfScope)
-					}
-					if err == nil && len(results) > 0 && inScope == 0 {
-						err = fmt.Errorf("provider returned %d URLs but none matched requested domain %s; %s may have ignored the target scope", outOfScope, job.Target, job.Engine)
-					}
-				}
-				if err == nil {
-					err = s.finish(job)
-				}
-				if err != nil {
-					s.failed(job, err)
-				}
-				if cfg.Delay > 0 {
-					timer := time.NewTimer(cfg.Delay)
-					select {
-					case <-ctx.Done():
-						timer.Stop()
-						return
-					case <-timer.C:
-					}
-				}
-			}
-		}()
-	}
 	var produced int
 	readErr := readLines(input, func(target string) error {
 		if !ValidTarget(target) {
 			return fmt.Errorf("invalid target %q", target)
 		}
-		queue := func(engine, query string) error {
-			job := Job{Target: target, Engine: engine, Query: query, ID: jobID(engine, query)}
-			if s.isCompleted(job.ID) {
-				return nil
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case jobs <- job:
-				produced++
-				return nil
+		scope, err := discovery.NewScope(target, cfg.IncludeSubdomains, cfg.AllowPrivate)
+		if err != nil {
+			return err
+		}
+		matchers := make([]dorkfilter.Matcher, len(templates))
+		for i, tpl := range templates {
+			matchers[i], err = dorkfilter.Compile(tpl, target)
+			if err != nil {
+				return fmt.Errorf("dork %q: %w", tpl, err)
 			}
 		}
-		for _, template := range templates {
-			for _, engine := range engines {
-				if passive(engine) {
-					continue
-				}
-				if err := queue(engine, scopedQuery(template, target)); err != nil {
-					return err
-				}
+		observed := map[string]*discovery.Observation{}
+		queryFound := map[string]bool{}
+		successes, attempts := 0, 0
+		var jobs []Job
+		for _, engine := range engines {
+			if engine == "crawl" {
+				continue
 			}
+			if passive(engine) {
+				query := target
+				if engine == "yahoo" {
+					query = "site:" + target
+				}
+				jobs = append(jobs, Job{Target: target, Engine: engine, Query: query, ID: jobID(engine, query)})
+				continue
+			}
+			for _, tpl := range templates {
+				q := scopedQuery(tpl, target)
+				jobs = append(jobs, Job{Target: target, Engine: engine, Query: q, ID: jobID(engine, q)})
+			}
+		}
+		var mu sync.Mutex
+		sem := make(chan struct{}, cfg.Concurrency)
+		var wg sync.WaitGroup
+		for _, job := range jobs {
+			if s.isCompleted(job.ID) {
+				continue
+			}
+			produced++
+			attempts++
+			wg.Add(1)
+			go func(job Job) {
+				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				defer func() { <-sem }()
+				if cfg.Verbose && !cfg.Silent {
+					fmt.Fprintf(cfg.Stderr, "dorker-bh: querying %s %q\n", job.Engine, job.Query)
+				}
+				results, e := search(ctx, job.Engine, job.Query)
+				inScope, outScope := 0, 0
+				mu.Lock()
+				defer mu.Unlock()
+				if e == nil {
+					for _, raw := range results {
+						canon, ce := discovery.Canonicalize(raw)
+						if ce != nil || !scope.ContainsString(canon) {
+							outScope++
+							continue
+						}
+						inScope++
+						obs := discovery.Observation{URL: canon, Target: target, Sources: []string{job.Engine}}
+						if !passive(job.Engine) {
+							obs.Queries = []string{job.Query}
+							queryFound[canon] = true
+						}
+						discovery.Merge(observed, obs)
+					}
+					if len(results) > 0 && inScope == 0 {
+						e = fmt.Errorf("provider returned %d URLs but none matched requested domain %s; %s may have ignored the target scope", outScope, target, job.Engine)
+					}
+				}
+				if e != nil {
+					s.failed(job, e)
+				} else {
+					successes++
+					if fe := s.finish(job); fe != nil {
+						s.failed(job, fe)
+					}
+				}
+			}(job)
+		}
+		wg.Wait()
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		for _, engine := range engines {
-			if passive(engine) {
-				if err := queue(engine, target); err != nil {
+			if engine != "crawl" {
+				continue
+			}
+			attempts++
+			produced++
+			seeds := []string{"https://" + target + "/", "http://" + target + "/"}
+			for raw := range observed {
+				seeds = append(seeds, raw)
+			}
+			obs, _, e := crawlRun(ctx, scope, seeds, crawl.Config{Depth: cfg.CrawlDepth, Requests: cfg.CrawlRequests, Duration: cfg.CrawlDuration, ResponseBytes: cfg.CrawlResponseBytes, Concurrency: min(cfg.CrawlConcurrency, cfg.Concurrency), Delay: cfg.CrawlDelay, Timeout: cfg.Timeout, AllowPrivate: cfg.AllowPrivate})
+			if e != nil {
+				s.failed(Job{Target: target, Engine: "crawl"}, e)
+			} else {
+				successes++
+				for _, o := range obs {
+					discovery.Merge(observed, o)
+				}
+			}
+		}
+		if attempts > 0 && successes == 0 {
+			return fmt.Errorf("%d search jobs failed", attempts)
+		}
+		keys := make([]string, 0, len(observed))
+		for raw := range observed {
+			keys = append(keys, raw)
+		}
+		sort.Strings(keys)
+		for _, raw := range keys {
+			o := *observed[raw]
+			matched := queryFound[raw]
+			for i, m := range matchers {
+				ok, state := m.Match(o, cfg.IncludeUnverifiedFilters)
+				if ok {
+					o.Queries = append(o.Queries, Synthesize(templates[i], target))
+					o.FilterState = state
+					matched = true
+				} else if o.FilterState == "" && state == "unverified_filter" {
+					o.FilterState = state
+				}
+			}
+			if matched {
+				if o.FilterState == "" {
+					o.FilterState = "matched"
+				}
+				if err := s.addObservation(o); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	})
-	close(jobs)
-	workers.Wait()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if readErr != nil && !errors.Is(readErr, context.Canceled) {
 		return readErr
 	}
-	if s.failures > 0 {
+	if readErr == nil && s.failures > 0 && s.count == 0 {
 		return fmt.Errorf("%d search jobs failed", s.failures)
 	}
 	if produced == 0 && !errors.Is(readErr, context.Canceled) && len(s.completed) == 0 {
