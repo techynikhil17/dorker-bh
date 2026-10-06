@@ -39,6 +39,9 @@ func Compile(template, target string) (Matcher, error) {
 			tok.text = strings.TrimPrefix(tok.text, "-")
 		}
 		lower := strings.ToLower(tok.text)
+		if strings.EqualFold(tok.text, target) {
+			continue
+		}
 		if strings.HasPrefix(lower, "site:") {
 			if !strings.EqualFold(strings.TrimPrefix(tok.text, "site:"), target) {
 				return Matcher{}, fmt.Errorf("site operator must match target %s", target)

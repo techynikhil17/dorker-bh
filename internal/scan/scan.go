@@ -455,7 +455,6 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 			contentTerms = append(contentTerms, matchers[i].ContentTerms()...)
 		}
 		observed := map[string]*discovery.Observation{}
-		queryFound := map[string]bool{}
 		var successfulJobs []Job
 		successes, attempts := 0, 0
 		var jobs []Job
@@ -504,7 +503,9 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 						return
 					}
 				}
-				results, e := search(ctx, job.Engine, job.Query)
+				providerCtx, cancelProvider := context.WithTimeout(ctx, cfg.Timeout)
+				results, e := search(providerCtx, job.Engine, job.Query)
+				cancelProvider()
 				inScope, outScope := 0, 0
 				mu.Lock()
 				defer mu.Unlock()
@@ -517,10 +518,6 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 						}
 						inScope++
 						obs := discovery.Observation{URL: canon, Target: target, Sources: []string{job.Engine}}
-						if !passive(job.Engine) {
-							obs.Queries = []string{job.Query}
-							queryFound[canon] = true
-						}
 						discovery.Merge(observed, obs)
 					}
 					if len(results) > 0 && inScope == 0 {
@@ -574,7 +571,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 		sort.Strings(keys)
 		for _, raw := range keys {
 			o := *observed[raw]
-			matched := queryFound[raw]
+			matched := false
 			for i, m := range matchers {
 				ok, state := m.Match(o, cfg.IncludeUnverifiedFilters)
 				if ok {

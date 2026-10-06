@@ -46,8 +46,40 @@ func TestRunScopesQueriesAndResultsToTarget(t *testing.T) {
 	if query != "site:kohls.com inurl:admin" {
 		t.Fatalf("unscoped query %q", query)
 	}
-	if got := stdout.String(); got != "https://kohls.com/login\nhttps://www.kohls.com/admin\n" {
+	if got := stdout.String(); got != "https://www.kohls.com/admin\n" {
 		t.Fatalf("out-of-scope results: %q", got)
+	}
+}
+
+func TestQueryProviderCannotBypassLocalDorkFilter(t *testing.T) {
+	dir := t.TempDir()
+	dorks := filepath.Join(dir, "dorks.txt")
+	os.WriteFile(dorks, []byte("site:{target} inurl:graphql\n"), 0600)
+	var stdout bytes.Buffer
+	cfg := Config{Dorks: dorks, Engines: "duckduckgo", Concurrency: 1, Timeout: time.Second, Stdin: strings.NewReader("example.com\n"), Stdout: &stdout, Stderr: io.Discard, Search: func(context.Context, string, string) ([]string, error) {
+		return []string{"https://example.com/products/widget", "https://example.com/api/graphql"}, nil
+	}}
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "https://example.com/api/graphql\n" {
+		t.Fatalf("irrelevant query results leaked: %q", stdout.String())
+	}
+}
+
+func TestProviderJobContextUsesConfiguredTimeout(t *testing.T) {
+	dir := t.TempDir()
+	dorks := filepath.Join(dir, "dorks.txt")
+	os.WriteFile(dorks, []byte("site:{target}\n"), 0600)
+	cfg := Config{Dorks: dorks, Engines: "yahoo", Concurrency: 1, Timeout: 50 * time.Millisecond, Stdin: strings.NewReader("example.com\n"), Stdout: io.Discard, Stderr: io.Discard, Search: func(ctx context.Context, e, q string) ([]string, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 100*time.Millisecond {
+			return nil, errors.New("provider context lacks configured deadline")
+		}
+		return nil, nil
+	}}
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatal(err)
 	}
 }
 
