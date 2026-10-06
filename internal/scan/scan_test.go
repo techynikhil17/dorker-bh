@@ -91,6 +91,21 @@ func TestPartialProviderFailureStillReturnsResults(t *testing.T) {
 	}
 }
 
+func TestPartialProviderFailureWithSuccessfulEmptyProviderSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	dorks := filepath.Join(dir, "dorks.txt")
+	os.WriteFile(dorks, []byte("site:{target} inurl:missing\n"), 0600)
+	cfg := Config{Dorks: dorks, Engines: "duckduckgo,yahoo", Concurrency: 2, Timeout: time.Second, Stdin: strings.NewReader("example.com\n"), Stdout: io.Discard, Stderr: io.Discard, Search: func(_ context.Context, e, q string) ([]string, error) {
+		if e == "duckduckgo" {
+			return nil, errors.New("challenge")
+		}
+		return nil, nil
+	}}
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("successful empty provider should keep run successful: %v", err)
+	}
+}
+
 func TestRunReportsWhenProviderReturnsOnlyOutOfScopeURLs(t *testing.T) {
 	dir := t.TempDir()
 	dorks := filepath.Join(dir, "dorks.txt")

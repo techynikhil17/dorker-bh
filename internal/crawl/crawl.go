@@ -1,6 +1,8 @@
 package crawl
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +25,7 @@ type Config struct {
 	Concurrency     int
 	Delay, Timeout  time.Duration
 	AllowPrivate    bool
+	ContentTerms    []string
 }
 type Stats struct {
 	Requests        int
@@ -31,6 +35,38 @@ type queued struct {
 	url    string
 	depth  int
 	source string
+}
+type hostPacer struct {
+	mu    sync.Mutex
+	delay time.Duration
+	next  map[string]time.Time
+}
+
+func newHostPacer(delay time.Duration) *hostPacer {
+	return &hostPacer{delay: delay, next: map[string]time.Time{}}
+}
+func (p *hostPacer) wait(ctx context.Context, host string) error {
+	if p.delay <= 0 {
+		return nil
+	}
+	p.mu.Lock()
+	now := time.Now()
+	slot := now
+	if n := p.next[host]; n.After(slot) {
+		slot = n
+	}
+	p.next[host] = slot.Add(p.delay)
+	p.mu.Unlock()
+	if wait := time.Until(slot); wait > 0 {
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil
 }
 
 func Run(ctx context.Context, scope discovery.Scope, seeds []string, cfg Config) ([]discovery.Observation, Stats, error) {
@@ -60,7 +96,27 @@ func Run(ctx context.Context, scope discovery.Scope, seeds []string, cfg Config)
 			add(u.Scheme+"://"+u.Host+"/sitemap.xml", 0, "standard")
 		}
 	}
-	client := &http.Client{Timeout: cfg.Timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if !cfg.AllowPrivate {
+		transport.DialContext = func(dialCtx context.Context, network, address string) (net.Conn, error) {
+			host, port, e := net.SplitHostPort(address)
+			if e != nil {
+				return nil, e
+			}
+			ips, e := net.DefaultResolver.LookupIP(dialCtx, "ip", host)
+			if e != nil {
+				return nil, e
+			}
+			dialer := net.Dialer{}
+			for _, ip := range ips {
+				if discovery.IsPublicIP(ip) {
+					return dialer.DialContext(dialCtx, network, net.JoinHostPort(ip.String(), port))
+				}
+			}
+			return nil, fmt.Errorf("host %s resolved only to non-public addresses", host)
+		}
+	}
+	client := &http.Client{Transport: transport, Timeout: cfg.Timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if !scope.Contains(req.URL) {
 			return http.ErrUseLastResponse
 		}
@@ -70,6 +126,7 @@ func Run(ctx context.Context, scope discovery.Scope, seeds []string, cfg Config)
 		return nil
 	}}
 	stats := Stats{}
+	pacer := newHostPacer(cfg.Delay)
 	var count atomic.Int64
 	for len(current) > 0 && ctx.Err() == nil {
 		batch := current
@@ -103,12 +160,8 @@ func Run(ctx context.Context, scope discovery.Scope, seeds []string, cfg Config)
 					return
 				}
 				defer func() { <-sem }()
-				if cfg.Delay > 0 {
-					select {
-					case <-time.After(cfg.Delay):
-					case <-ctx.Done():
-						return
-					}
+				if e := pacer.wait(ctx, mustURL(item.url).Hostname()); e != nil {
+					return
 				}
 				if !cfg.AllowPrivate {
 					ips, e := net.DefaultResolver.LookupIP(ctx, "ip", mustURL(item.url).Hostname())
@@ -146,12 +199,23 @@ func Run(ctx context.Context, scope discovery.Scope, seeds []string, cfg Config)
 					results <- result{item: item, status: resp.StatusCode, ctype: resp.Header.Get("Content-Type"), err: errors.New("response exceeds crawl-response-bytes")}
 					return
 				}
+				if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "gzip") || strings.HasSuffix(strings.ToLower(item.url), ".gz") {
+					gz, gzErr := gzip.NewReader(bytes.NewReader(data))
+					if gzErr == nil {
+						unzipped, readErr := io.ReadAll(io.LimitReader(gz, cfg.ResponseBytes+1))
+						gz.Close()
+						if readErr != nil || int64(len(unzipped)) > cfg.ResponseBytes {
+							results <- result{item: item, err: errors.New("decompressed response exceeds crawl-response-bytes")}
+							return
+						}
+						data = unzipped
+					}
+				}
 				body := string(data)
 				results <- result{item: item, status: resp.StatusCode, ctype: resp.Header.Get("Content-Type"), body: body, links: extract(item.url, resp.Header.Get("Content-Type"), body)}
 			}(item)
 		}
-		wg.Wait()
-		close(results)
+		go func() { wg.Wait(); close(results) }()
 		for r := range results {
 			if r.err != nil {
 				continue
@@ -160,9 +224,15 @@ func Run(ctx context.Context, scope discovery.Scope, seeds []string, cfg Config)
 			o.Verified = true
 			o.StatusCode = r.status
 			o.ContentType = r.ctype
-			o.Content = r.body
+			o.Content = matchingContent(r.body, cfg.ContentTerms)
 			discovery.Merge(observations, o)
 			for _, l := range r.links {
+				if l.source == "form" {
+					if canon, e := discovery.Canonicalize(l.url); e == nil && scope.ContainsString(canon) {
+						discovery.Merge(observations, discovery.Observation{URL: canon, Target: scope.Target, Sources: []string{"form"}, Depth: r.item.depth + 1})
+					}
+					continue
+				}
 				add(l.url, r.item.depth+1, l.source)
 			}
 		}
@@ -176,6 +246,18 @@ func Run(ctx context.Context, scope discovery.Scope, seeds []string, cfg Config)
 		return out, stats, ctx.Err()
 	}
 	return out, stats, nil
+}
+
+func matchingContent(body string, terms []string) string {
+	lower := strings.ToLower(body)
+	var found []string
+	for _, term := range terms {
+		term = strings.ToLower(term)
+		if strings.Contains(lower, term) {
+			found = append(found, term)
+		}
+	}
+	return strings.Join(found, "\n")
 }
 
 func mustURL(raw string) *url.URL { u, _ := url.Parse(raw); return u }

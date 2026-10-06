@@ -16,6 +16,16 @@ type predicate struct {
 }
 type Matcher struct{ predicates []predicate }
 
+func (m Matcher) ContentTerms() []string {
+	var out []string
+	for _, p := range m.predicates {
+		if p.content {
+			out = append(out, p.value)
+		}
+	}
+	return out
+}
+
 func Compile(template, target string) (Matcher, error) {
 	template = strings.ReplaceAll(strings.ReplaceAll(template, "{target}", target), "%s", target)
 	tokens, err := lex(template)
@@ -96,6 +106,7 @@ func (m Matcher) Match(obs discovery.Observation, includeUnverified bool) (bool,
 	urlText := strings.ToLower(u.EscapedPath() + "?" + u.RawQuery)
 	decoded, _ := url.PathUnescape(urlText)
 	content := strings.ToLower(obs.Content)
+	unverified := false
 	for _, p := range m.predicates {
 		var hit bool
 		switch p.kind {
@@ -109,6 +120,7 @@ func (m Matcher) Match(obs discovery.Observation, includeUnverified bool) (bool,
 				hit = hit || strings.Contains(content, p.value)
 				if !hit && !obs.Verified {
 					if includeUnverified {
+						unverified = true
 						continue
 					}
 					return false, "unverified_filter"
@@ -121,6 +133,9 @@ func (m Matcher) Match(obs discovery.Observation, includeUnverified bool) (bool,
 		if !hit {
 			return false, "not_matched"
 		}
+	}
+	if unverified {
+		return true, "unverified_filter"
 	}
 	return true, "matched"
 }

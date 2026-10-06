@@ -305,7 +305,7 @@ func ParseResults(engine string, body io.Reader) ([]string, error) {
 				}
 			}
 			if token.Data == "a" && !f.ad {
-				if engine == "duckduckgo" && strings.Contains(" "+class+" ", " result__a ") {
+				if engine == "duckduckgo" && (strings.Contains(" "+class+" ", " result__a ") || strings.Contains(" "+class+" ", " result-link ")) {
 					add(f.href)
 				}
 				if engine == "bing" && f.bingResult {

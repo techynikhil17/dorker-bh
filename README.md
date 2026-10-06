@@ -1,62 +1,82 @@
 # dorker-bh
 
-`dorker-bh` queries public DuckDuckGo, Bing, and Google results and passive Wayback and Common Crawl indexes. Use it only on targets you are authorized to audit. It prints discovered destination URLs, one per line, so results can be piped to other tools.
+`dorker-bh` discovers real URLs for authorized security reconnaissance. It combines public search results, Wayback and Common Crawl indexes, Yahoo site results, and a bounded crawler of the target itself. Dorks are also applied locally to collected URLs, avoiding one upstream query per dork for broad collectors.
 
-## Build
+Every emitted URL was observed in a provider response or on the authorized target. The tool does not invent paths, submit forms, inject payloads, bypass CAPTCHAs, or evade provider quotas.
+
+## Install
 
 Go 1.26 or later:
 
 ```sh
-go build -trimpath -o dorker-bh .
+go install github.com/techynikhil17/dorker-bh@latest
+export PATH="$(go env GOPATH)/bin:$PATH"
 ```
 
-The module has no server-side services. Release builds disable CGO, producing a standalone binary. You can also install it with `go install github.com/techynikhil17/dorker-bh@latest`.
+Or run `go build -trimpath -o dorker-bh .` in a checkout.
 
-## Usage
+## Quick start
 
 ```sh
-./dorker-bh -l targets.txt -d dorks.txt -e duckduckgo,bing -c 10 -o results.txt
-cat targets.txt | ./dorker-bh -d dorks.txt -s | httpx -silent
-./dorker-bh -l targets.txt -d dorks.txt -e duckduckgo,bing,google,wayback,commoncrawl --json -o results.jsonl
+# Default: DuckDuckGo, Yahoo, archives, and bounded crawling
+dorker-bh -l targets.txt -d dorks.txt -o results.txt -v
+
+# No requests to discovered target URLs
+dorker-bh -l targets.txt -d dorks.txt \
+  -e duckduckgo,yahoo,wayback,commoncrawl -o results.txt
+
+# Include subdomains and save provenance
+dorker-bh -l targets.txt -d dorks.txt --include-subdomains --json -o results.jsonl
+
+printf 'example.com\n' | dorker-bh -d dorks.txt --resume=
 ```
 
-`targets.txt` contains one bare domain or subdomain per line. `dorks.txt` contains one query template per line. Blank lines and lines beginning with `#` are skipped. Each template should contain `{target}` or `%s`, for example:
+Targets are bare hostnames. Exact-host scope is the default; `--include-subdomains` includes child hosts. Blank lines and lines beginning with `#` are ignored.
 
 ```text
+site:{target} inurl:login
 site:{target} inurl:admin
-site:%s ext:env
+site:{target} ext:json
+site:{target} "swagger"
+site:{target} -inurl:logout account
 ```
 
-The `{target}` or `%s` placeholder is treated as the domain scope, not as a required text term. If a template does not already contain `site:<target>`, the tool adds it to the search query. Regardless of what an engine returns, only URLs on the requested domain or its subdomains are written. Search engines can ignore operators or return unrelated results; if every result is outside the target, the job is reported as failed with that explanation.
+Templates support `{target}` and `%s`, plus `site:`, `inurl:`, `ext:`, `filetype:`, quoted strings, bare terms, and unary negative terms. Unsupported operators fail clearly. Quoted content filters require fetched content; passive URLs that cannot prove the filter are omitted unless `--include-unverified-filters` is set.
 
-Flags: `-l/--list`, `-d/--dorks`, `-e/--engines` (default `duckduckgo,bing`), `-c/--concurrency` (default `10`), `-p/--proxies`, `-o/--output`, `--delay`, `--timeout` (default `10s`), `--retries` (default `3`), `--json`, `-s/--silent`, `-v/--verbose`, and `--resume`.
+## Providers
 
-Proxy files accept `http://`, `https://`, and `socks5://` URLs, one per line. A proxy is selected for every request, including retries. `--silent` always prints raw URLs to stdout, even when `--json` writes JSON Lines to the output file. Operational messages go to stderr.
+The default is `duckduckgo,yahoo,wayback,commoncrawl,crawl`.
 
-The default checkpoint is `.dorker-bh.resume`. On interruption or provider errors, successful jobs remain recorded; the next invocation resumes them. A fully successful run removes this default checkpoint so a later scan starts fresh. `--resume FILE` uses a persistent custom checkpoint. `--resume=` disables checkpointing. When resuming to a file, use the same `-o` and `--json` settings.
+- `duckduckgo`: HTML and Lite pages. Challenges are reported while other providers continue.
+- `yahoo`: one broad `site:<target>` mobile search per target, followed by local dork matching.
+- `wayback`, `commoncrawl`: passive indexes queried once per target.
+- `crawl`: GET-only discovery from origins, robots, sitemaps, HTML, redirects, JavaScript strings, and source maps.
+- `yandex`: experimental and opt-in because its public HTML frequently returns a robot challenge.
+- `bing`, `google`: opt-in compatibility providers. Bing can use `DORKER_SERPAPI_KEY`; existing Google Custom Search customers can use `DORKER_GOOGLE_API_KEY` and `DORKER_GOOGLE_CSE_ID`.
 
-Wayback and Common Crawl are passive providers selected with `-e`. They query each target once and return indexed URLs; search dork syntax does not apply to archive indexes. Common Crawl requests are serialized and paced to respect its index service. Archive results are capped at 1,000 URLs per target and provider.
+Provider failures go to stderr and do not discard successful providers' results. A target fails when all its selected providers fail.
 
-Google HTML may serve a JavaScript interstitial. Existing Custom Search JSON API customers can set `DORKER_GOOGLE_API_KEY` and `DORKER_GOOGLE_CSE_ID` to use Google's API instead. The API is closed to new customers; see [Google's current API notice](https://developers.google.com/custom-search/v1/overview).
+## Crawler boundaries
 
-### Bing results
+Defaults per target:
 
-The no-key Bing HTML mode uses the public search page. Bing sometimes ignores `site:` and other query operators, returning unrelated links even for a correctly encoded query. The tool rejects links outside the requested domain and reports a failed job when all returned links are out of scope.
-
-For a structured Bing results path, set `DORKER_SERPAPI_KEY` to a [SerpApi key](https://serpapi.com/bing-search-api). With that variable set, `-e bing` uses SerpApi's Bing engine and only its organic result links. The [free plan currently lists 250 searches per month and 50 per hour](https://serpapi.com/pricing); an account and key are required, and limits can change. Each target/dork pair uses one search. The target-domain filter still applies because search providers can return irrelevant links.
-
-In Bash or WSL, enter the key without putting it in shell history:
-
-```sh
-read -r -s -p 'SerpApi key: ' DORKER_SERPAPI_KEY; echo
-export DORKER_SERPAPI_KEY
-printf 'go.dev\n' | dorker-bh -d <(printf 'site:{target} documentation\n') -e bing -c 1 --resume= -v
+```text
+--crawl-depth=2
+--crawl-requests=1000
+--crawl-duration=10m
+--crawl-response-bytes=5242880
+--crawl-concurrency=5
+--crawl-delay=200ms
 ```
 
-Unset the variable with `unset DORKER_SERPAPI_KEY` to use the public Bing HTML mode again. No paid subscription is required within the free plan's allowance. A key is not bundled with the CLI.
+The crawler follows only in-scope HTTP/S URLs, checks redirects before following, rejects credentials, and blocks private, loopback, link-local, multicast, and unspecified IP addresses. `--allow-private` enables explicitly authorized internal targets. It never submits forms.
 
-Run the opt-in 100,000-job memory test with `DORKER_BH_STRESS=1 go test ./internal/scan -run TestHundredThousandJobsHeap -v`.
+## Output and resume
 
-Search HTML and anti-bot behavior can change without notice. A query blocked by an engine is reported as a failed job; the checkpoint retains only successful jobs. The tool never follows result links or scans discovered URLs.
+Raw output is one canonical URL per line. `--json` adds sources, query, verification status, HTTP status, content type, depth, and filter state. Global deduplication merges repeated discoveries.
 
-DuckDuckGo may return HTTP 202 with a bot challenge, including from its Lite endpoint. This is an upstream block; use `-e bing` or another provider and retry DuckDuckGo later. After upgrading from v0.1.0, start a fresh scan with `--resume=` and a new output file to discard any previously saved URLs outside the target scope.
+The automatic `.dorker-bh.resume` checkpoint is removed after a fully successful run. `--resume FILE` keeps a custom checkpoint; `--resume=` disables checkpointing. Start with a fresh checkpoint when upgrading from releases before this hybrid architecture.
+
+The original flags remain: `-l/--list`, `-d/--dorks`, `-e/--engines`, `-c/--concurrency`, `-p/--proxies`, `-o/--output`, `--delay`, `--timeout`, `--retries`, `--json`, `-s/--silent`, `-v/--verbose`, and `--resume`.
+
+Proxy files accept HTTP, HTTPS, SOCKS5, and SOCKS5H URLs. Search requests rotate proxies round-robin. Use this tool only for systems where you have explicit authorization.

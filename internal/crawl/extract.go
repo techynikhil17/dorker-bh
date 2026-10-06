@@ -43,8 +43,10 @@ func extract(baseRaw, ctype, body string) []link {
 			t := z.Token()
 			for _, a := range t.Attr {
 				switch strings.ToLower(a.Key) {
-				case "href", "src", "action", "poster", "data-src":
+				case "href", "src", "poster", "data-src":
 					add(a.Val, "html")
+				case "action":
+					add(a.Val, "form")
 				case "srcset":
 					for _, v := range strings.Split(a.Val, ",") {
 						add(strings.Fields(v)[0], "html")

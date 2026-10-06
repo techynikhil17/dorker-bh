@@ -185,3 +185,17 @@ func TestYahooEndpointUsesBroadSiteQuery(t *testing.T) {
 		t.Fatalf("%s %v", got, err)
 	}
 }
+
+func TestDuckDuckGoLiteResultLink(t *testing.T) {
+	got, err := ParseResults("duckduckgo", strings.NewReader(`<a rel="nofollow" class="result-link" href="https://example.com/admin">x</a>`))
+	if err != nil || len(got) != 1 || got[0] != "https://example.com/admin" {
+		t.Fatalf("%#v %v", got, err)
+	}
+}
+
+func TestParseArchivePageCount(t *testing.T) {
+	pages, err := parseArchivePageCount(strings.NewReader(`{"blocks":12,"pages":3,"pageSize":4}`))
+	if err != nil || pages != 3 {
+		t.Fatalf("pages=%d err=%v", pages, err)
+	}
+}

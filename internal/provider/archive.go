@@ -2,12 +2,14 @@ package provider
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,7 +26,7 @@ func (c *Client) searchArchive(ctx context.Context, engine, domain string) ([]st
 	q.Set("url", domain)
 	q.Set("output", "json")
 	q.Set("limit", "1000")
-	var endpoint string
+	var base string
 	switch engine {
 	case "wayback":
 		q.Set("matchType", "domain")
@@ -32,7 +34,7 @@ func (c *Client) searchArchive(ctx context.Context, engine, domain string) ([]st
 		q.Set("filter", "statuscode:200")
 		q.Set("collapse", "urlkey")
 		q.Set("gzip", "false")
-		endpoint = "https://web.archive.org/cdx/search/cdx?" + q.Encode()
+		base = "https://web.archive.org/cdx/search/cdx"
 	case "commoncrawl":
 		index, err := c.commonCrawlEndpoint(ctx)
 		if err != nil {
@@ -41,28 +43,89 @@ func (c *Client) searchArchive(ctx context.Context, engine, domain string) ([]st
 		q.Set("matchType", "domain")
 		q.Set("filter", "status:200")
 		q.Set("collapse", "urlkey")
-		endpoint = index + "?" + q.Encode()
+		base = index
 	default:
 		return nil, fmt.Errorf("unsupported archive provider %q", engine)
 	}
-	if engine == "commoncrawl" {
-		if err := c.paceCommonCrawl(ctx); err != nil {
+	fetch := func(values url.Values) (*bytes.Buffer, error) {
+		if engine == "commoncrawl" {
+			if err := c.paceCommonCrawl(ctx); err != nil {
+				return nil, err
+			}
+		}
+		return c.fetch(ctx, base+"?"+values.Encode())
+	}
+	countQ := cloneValues(q)
+	countQ.Del("limit")
+	countQ.Set("pageSize", "1")
+	countQ.Set("showNumPages", "true")
+	countData, countErr := fetch(countQ)
+	pages := 0
+	if countErr == nil {
+		pages, countErr = parseArchivePageCount(countData)
+		releaseBody(countData)
+	}
+	queries := []url.Values{}
+	if countErr == nil && pages > 0 {
+		for page := 0; page < pages; page++ {
+			pageQ := cloneValues(q)
+			pageQ.Del("limit")
+			pageQ.Set("pageSize", "1")
+			pageQ.Set("page", strconv.Itoa(page))
+			queries = append(queries, pageQ)
+		}
+	} else {
+		queries = append(queries, q)
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	for _, values := range queries {
+		data, err := fetch(values)
+		var status statusError
+		if errors.As(err, &status) && status.Code == 404 {
+			continue
+		}
+		if err != nil {
 			return nil, err
 		}
+		var urls []string
+		if engine == "wayback" {
+			urls, err = parseWayback(data, domain)
+		} else {
+			urls, err = parseCommonCrawl(data, domain)
+		}
+		releaseBody(data)
+		if err != nil {
+			return nil, err
+		}
+		for _, raw := range urls {
+			if _, ok := seen[raw]; !ok {
+				seen[raw] = struct{}{}
+				out = append(out, raw)
+			}
+		}
 	}
-	data, err := c.fetch(ctx, endpoint)
-	var status statusError
-	if errors.As(err, &status) && status.Code == 404 {
-		return nil, nil
+	return out, nil
+}
+
+func cloneValues(in url.Values) url.Values {
+	out := url.Values{}
+	for k, values := range in {
+		out[k] = append([]string(nil), values...)
 	}
-	if err != nil {
-		return nil, err
+	return out
+}
+func parseArchivePageCount(r io.Reader) (int, error) {
+	var v struct {
+		Pages int `json:"pages"`
 	}
-	defer releaseBody(data)
-	if engine == "wayback" {
-		return parseWayback(data, domain)
+	if err := json.NewDecoder(r).Decode(&v); err != nil {
+		return 0, err
 	}
-	return parseCommonCrawl(data, domain)
+	if v.Pages < 0 {
+		return 0, errors.New("archive returned invalid page count")
+	}
+	return v.Pages, nil
 }
 
 func (c *Client) commonCrawlEndpoint(ctx context.Context) (string, error) {

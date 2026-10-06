@@ -35,7 +35,16 @@ func (s Scope) Contains(u *url.URL) bool {
 }
 
 func IsPublicIP(ip net.IP) bool {
-	return ip != nil && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsMulticast() && !ip.IsUnspecified()
+	if ip == nil || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	for _, raw := range []string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32"} {
+		_, block, _ := net.ParseCIDR(raw)
+		if block.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 type Observation struct {
@@ -65,11 +74,22 @@ func Canonicalize(raw string) (string, error) {
 	if u.Path == "." {
 		u.Path = "/"
 	}
-	q := u.Query()
-	for _, k := range []string{"msockid", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"} {
-		q.Del(k)
+	tracking := map[string]struct{}{"msockid": {}, "utm_source": {}, "utm_medium": {}, "utm_campaign": {}, "utm_term": {}, "utm_content": {}}
+	parts := strings.Split(u.RawQuery, "&")
+	kept := parts[:0]
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		key := strings.SplitN(part, "=", 2)[0]
+		if decoded, e := url.QueryUnescape(key); e == nil {
+			if _, drop := tracking[strings.ToLower(decoded)]; drop {
+				continue
+			}
+		}
+		kept = append(kept, part)
 	}
-	u.RawQuery = q.Encode()
+	u.RawQuery = strings.Join(kept, "&")
 	return u.String(), nil
 }
 

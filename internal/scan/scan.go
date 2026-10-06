@@ -375,6 +375,9 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 		if engine != "duckduckgo" && engine != "bing" && engine != "google" && engine != "yandex" && engine != "crawl" && !passive(engine) {
 			return fmt.Errorf("unsupported engine %q", engine)
 		}
+		if engine == "crawl" && (cfg.CrawlDepth < 0 || cfg.CrawlRequests < 1 || cfg.CrawlDuration <= 0 || cfg.CrawlResponseBytes < 1 || cfg.CrawlConcurrency < 1 || cfg.CrawlDelay < 0) {
+			return errors.New("invalid crawl depth, requests, duration, response bytes, concurrency or delay")
+		}
 	}
 	var proxies []string
 	if cfg.Proxies != "" {
@@ -397,21 +400,6 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	crawlRun := cfg.Crawl
 	if crawlRun == nil {
 		crawlRun = crawl.Run
-	}
-	if cfg.CrawlDepth == 0 {
-		cfg.CrawlDepth = 2
-	}
-	if cfg.CrawlRequests == 0 {
-		cfg.CrawlRequests = 1000
-	}
-	if cfg.CrawlDuration == 0 {
-		cfg.CrawlDuration = 10 * time.Minute
-	}
-	if cfg.CrawlResponseBytes == 0 {
-		cfg.CrawlResponseBytes = 5 << 20
-	}
-	if cfg.CrawlConcurrency == 0 {
-		cfg.CrawlConcurrency = 5
 	}
 	if cfg.Stdout == nil {
 		cfg.Stdout = os.Stdout
@@ -458,14 +446,17 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 			return err
 		}
 		matchers := make([]dorkfilter.Matcher, len(templates))
+		var contentTerms []string
 		for i, tpl := range templates {
 			matchers[i], err = dorkfilter.Compile(tpl, target)
 			if err != nil {
 				return fmt.Errorf("dork %q: %w", tpl, err)
 			}
+			contentTerms = append(contentTerms, matchers[i].ContentTerms()...)
 		}
 		observed := map[string]*discovery.Observation{}
 		queryFound := map[string]bool{}
+		var successfulJobs []Job
 		successes, attempts := 0, 0
 		var jobs []Job
 		for _, engine := range engines {
@@ -506,6 +497,13 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 				if cfg.Verbose && !cfg.Silent {
 					fmt.Fprintf(cfg.Stderr, "dorker-bh: querying %s %q\n", job.Engine, job.Query)
 				}
+				if cfg.Delay > 0 {
+					select {
+					case <-time.After(cfg.Delay):
+					case <-ctx.Done():
+						return
+					}
+				}
 				results, e := search(ctx, job.Engine, job.Query)
 				inScope, outScope := 0, 0
 				mu.Lock()
@@ -533,9 +531,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 					s.failed(job, e)
 				} else {
 					successes++
-					if fe := s.finish(job); fe != nil {
-						s.failed(job, fe)
-					}
+					successfulJobs = append(successfulJobs, job)
 				}
 			}(job)
 		}
@@ -547,17 +543,22 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 			if engine != "crawl" {
 				continue
 			}
+			crawlJob := Job{Target: target, Engine: "crawl", Query: target, ID: jobID("crawl", fmt.Sprintf("%s\x00%d\x00%d\x00%s", target, cfg.CrawlDepth, cfg.CrawlRequests, cfg.CrawlDuration))}
+			if s.isCompleted(crawlJob.ID) {
+				continue
+			}
 			attempts++
 			produced++
 			seeds := []string{"https://" + target + "/", "http://" + target + "/"}
 			for raw := range observed {
 				seeds = append(seeds, raw)
 			}
-			obs, _, e := crawlRun(ctx, scope, seeds, crawl.Config{Depth: cfg.CrawlDepth, Requests: cfg.CrawlRequests, Duration: cfg.CrawlDuration, ResponseBytes: cfg.CrawlResponseBytes, Concurrency: min(cfg.CrawlConcurrency, cfg.Concurrency), Delay: cfg.CrawlDelay, Timeout: cfg.Timeout, AllowPrivate: cfg.AllowPrivate})
+			obs, _, e := crawlRun(ctx, scope, seeds, crawl.Config{Depth: cfg.CrawlDepth, Requests: cfg.CrawlRequests, Duration: cfg.CrawlDuration, ResponseBytes: cfg.CrawlResponseBytes, Concurrency: min(cfg.CrawlConcurrency, cfg.Concurrency), Delay: cfg.CrawlDelay, Timeout: cfg.Timeout, AllowPrivate: cfg.AllowPrivate, ContentTerms: contentTerms})
 			if e != nil {
-				s.failed(Job{Target: target, Engine: "crawl"}, e)
+				s.failed(crawlJob, e)
 			} else {
 				successes++
+				successfulJobs = append(successfulJobs, crawlJob)
 				for _, o := range obs {
 					discovery.Merge(observed, o)
 				}
@@ -593,6 +594,11 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 				}
 			}
 		}
+		for _, job := range successfulJobs {
+			if err := s.finish(job); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if ctx.Err() != nil {
@@ -600,9 +606,6 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	}
 	if readErr != nil && !errors.Is(readErr, context.Canceled) {
 		return readErr
-	}
-	if readErr == nil && s.failures > 0 && s.count == 0 {
-		return fmt.Errorf("%d search jobs failed", s.failures)
 	}
 	if produced == 0 && !errors.Is(readErr, context.Canceled) && len(s.completed) == 0 {
 		return errors.New("no target domains found")

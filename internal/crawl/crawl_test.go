@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,5 +68,31 @@ func TestRunDoesNotFollowOutOfScopeRedirect(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Fatal("followed out-of-scope redirect")
+	}
+}
+
+func TestHostPacerSpacesConcurrentRequests(t *testing.T) {
+	p := newHostPacer(20 * time.Millisecond)
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.wait(context.Background(), "example.com"); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if elapsed := time.Since(start); elapsed < 35*time.Millisecond {
+		t.Fatalf("requests were not paced: %s", elapsed)
+	}
+}
+
+func TestMatchingContentRetainsOnlyRequestedTerms(t *testing.T) {
+	got := matchingContent("large page with Swagger and SECRET data", []string{"swagger", "openapi"})
+	if got != "swagger" {
+		t.Fatalf("stored %q", got)
 	}
 }

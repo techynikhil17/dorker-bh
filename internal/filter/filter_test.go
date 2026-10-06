@@ -37,6 +37,9 @@ func TestContentAndUnsupported(t *testing.T) {
 	if ok, state := m.Match(discovery.Observation{URL: "https://example.com/docs"}, false); ok || state != "unverified_filter" {
 		t.Fatalf("%v %s", ok, state)
 	}
+	if ok, state := m.Match(discovery.Observation{URL: "https://example.com/docs"}, true); !ok || state != "unverified_filter" {
+		t.Fatalf("included unknown filter must be labeled: %v %s", ok, state)
+	}
 	if ok, _ := m.Match(discovery.Observation{URL: "https://example.com/docs", Content: "Swagger UI", Verified: true}, false); !ok {
 		t.Fatal("content did not match")
 	}

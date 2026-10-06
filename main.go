@@ -15,29 +15,42 @@ import (
 
 func main() { os.Exit(run()) }
 
+func defaultConfig() scan.Config {
+	return scan.Config{Engines: "duckduckgo,yahoo,wayback,commoncrawl,crawl", Concurrency: 10, Timeout: 10 * time.Second, Retries: 3, Resume: ".dorker-bh.resume", CrawlDepth: 2, CrawlRequests: 1000, CrawlDuration: 10 * time.Minute, CrawlResponseBytes: 5 << 20, CrawlConcurrency: 5, CrawlDelay: 200 * time.Millisecond}
+}
+
 func run() int {
-	var cfg scan.Config
+	cfg := defaultConfig()
 	flag.StringVar(&cfg.List, "l", "", "file containing target domains")
 	flag.StringVar(&cfg.List, "list", "", "file containing target domains")
 	flag.StringVar(&cfg.Dorks, "d", "", "file containing dork templates")
 	flag.StringVar(&cfg.Dorks, "dorks", "", "file containing dork templates")
-	flag.StringVar(&cfg.Engines, "e", "duckduckgo,bing", "comma-separated providers: duckduckgo,bing,google,wayback,commoncrawl")
-	flag.StringVar(&cfg.Engines, "engines", "duckduckgo,bing", "comma-separated providers")
-	flag.IntVar(&cfg.Concurrency, "c", 10, "worker count")
-	flag.IntVar(&cfg.Concurrency, "concurrency", 10, "worker count")
+	flag.StringVar(&cfg.Engines, "e", cfg.Engines, "comma-separated providers: duckduckgo,yahoo,wayback,commoncrawl,crawl,bing,google,yandex")
+	flag.StringVar(&cfg.Engines, "engines", cfg.Engines, "comma-separated providers")
+	flag.IntVar(&cfg.Concurrency, "c", cfg.Concurrency, "worker count")
+	flag.IntVar(&cfg.Concurrency, "concurrency", cfg.Concurrency, "worker count")
 	flag.StringVar(&cfg.Proxies, "p", "", "HTTP/HTTPS/SOCKS5 proxy file")
 	flag.StringVar(&cfg.Proxies, "proxies", "", "HTTP/HTTPS/SOCKS5 proxy file")
 	flag.StringVar(&cfg.Output, "o", "", "output file")
 	flag.StringVar(&cfg.Output, "output", "", "output file")
 	flag.DurationVar(&cfg.Delay, "delay", 0, "delay between worker requests")
-	flag.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "request timeout")
-	flag.IntVar(&cfg.Retries, "retries", 3, "retries on rate limits and network errors")
+	flag.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "request timeout")
+	flag.IntVar(&cfg.Retries, "retries", cfg.Retries, "retries on rate limits and network errors")
 	flag.BoolVar(&cfg.JSON, "json", false, "write JSON Lines")
 	flag.BoolVar(&cfg.Silent, "s", false, "print URLs only, suppress operational logs")
 	flag.BoolVar(&cfg.Silent, "silent", false, "print URLs only, suppress operational logs")
 	flag.BoolVar(&cfg.Verbose, "v", false, "log queries and errors to stderr")
 	flag.BoolVar(&cfg.Verbose, "verbose", false, "log queries and errors to stderr")
-	flag.StringVar(&cfg.Resume, "resume", ".dorker-bh.resume", "checkpoint file (empty disables checkpointing)")
+	flag.StringVar(&cfg.Resume, "resume", cfg.Resume, "checkpoint file (empty disables checkpointing)")
+	flag.BoolVar(&cfg.IncludeSubdomains, "include-subdomains", false, "include subdomains of each target")
+	flag.BoolVar(&cfg.AllowPrivate, "allow-private", false, "allow crawling private and local addresses")
+	flag.BoolVar(&cfg.IncludeUnverifiedFilters, "include-unverified-filters", false, "include passive URLs whose content filters cannot be verified")
+	flag.IntVar(&cfg.CrawlDepth, "crawl-depth", cfg.CrawlDepth, "maximum crawl link depth")
+	flag.IntVar(&cfg.CrawlRequests, "crawl-requests", cfg.CrawlRequests, "maximum crawl requests per target")
+	flag.DurationVar(&cfg.CrawlDuration, "crawl-duration", cfg.CrawlDuration, "maximum crawl duration per target")
+	flag.Int64Var(&cfg.CrawlResponseBytes, "crawl-response-bytes", cfg.CrawlResponseBytes, "maximum decompressed bytes per crawl response")
+	flag.IntVar(&cfg.CrawlConcurrency, "crawl-concurrency", cfg.CrawlConcurrency, "crawl workers per target")
+	flag.DurationVar(&cfg.CrawlDelay, "crawl-delay", cfg.CrawlDelay, "delay before each crawl request")
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "dorker-bh: search engine reconnaissance for authorized targets")
 		fmt.Fprintln(flag.CommandLine.Output(), "Usage: dorker-bh -l targets.txt -d dorks.txt [flags]")

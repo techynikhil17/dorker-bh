@@ -1,6 +1,9 @@
 package discovery
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestScopeExactAndSubdomains(t *testing.T) {
 	exact, _ := NewScope("Example.COM", false, false)
@@ -21,9 +24,20 @@ func TestScopeExactAndSubdomains(t *testing.T) {
 	}
 }
 
+func TestDocumentationAndPrivateAddressesAreNotPublic(t *testing.T) {
+	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "192.0.2.1", "198.51.100.2", "203.0.113.3", "2001:db8::1"} {
+		if IsPublicIP(net.ParseIP(raw)) {
+			t.Errorf("accepted %s", raw)
+		}
+	}
+	if !IsPublicIP(net.ParseIP("1.1.1.1")) {
+		t.Fatal("rejected public IP")
+	}
+}
+
 func TestCanonicalizeAndMerge(t *testing.T) {
-	got, err := Canonicalize("HTTPS://Example.com:443/a/../b?x=1&msockid=junk#frag")
-	if err != nil || got != "https://example.com/b?x=1" {
+	got, err := Canonicalize("HTTPS://Example.com:443/a/../b?b=2&a=1&msockid=junk#frag")
+	if err != nil || got != "https://example.com/b?b=2&a=1" {
 		t.Fatalf("got %q %v", got, err)
 	}
 	m := map[string]*Observation{}
