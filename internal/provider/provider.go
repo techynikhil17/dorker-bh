@@ -245,7 +245,7 @@ func ParseResults(engine string, body io.Reader) ([]string, error) {
 		switch tt {
 		case html.TextToken:
 			text := strings.ToLower(string(z.Text()))
-			if strings.Contains(text, "captcha") || strings.Contains(text, "unusual traffic") || strings.Contains(text, "verify you are human") {
+			if strings.Contains(text, "captcha") || strings.Contains(text, "unusual traffic") || strings.Contains(text, "verify you are human") || strings.Contains(text, "please solve the challenge") {
 				challenge = true
 			}
 		case html.StartTagToken, html.SelfClosingTagToken:

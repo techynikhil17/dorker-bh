@@ -156,3 +156,10 @@ func TestParseResultsReportsChallenge(t *testing.T) {
 		t.Fatal("expected challenge error")
 	}
 }
+
+func TestBingSearchFormChallengeIsError(t *testing.T) {
+	_, err := ParseResults("bing", strings.NewReader(`<html><body><div>One last step</div><div>Please solve the challenge below to continue</div></body></html>`))
+	if err == nil {
+		t.Fatal("Bing challenge was treated as a successful empty result set")
+	}
+}
