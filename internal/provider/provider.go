@@ -142,6 +142,9 @@ func (c *Client) searchAt(ctx context.Context, engine, address string) ([]string
 		// DuckDuckGo occasionally challenges browser-like header sets with 202.
 		// Its HTML endpoint also accepts a minimal compatibility UA.
 		body, err = c.fetchWithUA(ctx, address, "Mozilla/5.0")
+		if errors.As(err, &status) && status.Code == http.StatusAccepted {
+			return nil, fmt.Errorf("DuckDuckGo returned a bot challenge (HTTP 202); retry later or use another engine: %w", err)
+		}
 	}
 	if err != nil {
 		return nil, err

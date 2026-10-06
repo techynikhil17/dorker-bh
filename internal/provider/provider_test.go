@@ -68,6 +68,22 @@ func TestDuckDuckGoCompatibilityFallback(t *testing.T) {
 	}
 }
 
+func TestDuckDuckGoChallengeReportsBlocked(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte("Unfortunately, bots use DuckDuckGo too."))
+	}))
+	defer server.Close()
+	client, err := NewClient(time.Second, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.searchAt(context.Background(), "duckduckgo", server.URL)
+	if err == nil || !strings.Contains(err.Error(), "bot challenge") {
+		t.Fatalf("expected clear challenge error, got %v", err)
+	}
+}
+
 func TestProxyRotation(t *testing.T) {
 	client, err := NewClient(time.Second, 0, []string{"http://127.0.0.1:8080", "socks5://127.0.0.1:1080"})
 	if err != nil {

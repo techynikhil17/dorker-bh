@@ -20,6 +20,55 @@ func TestSynthesize(t *testing.T) {
 	}
 }
 
+func TestRunScopesQueriesAndResultsToTarget(t *testing.T) {
+	dir := t.TempDir()
+	dorks := filepath.Join(dir, "dorks.txt")
+	if err := os.WriteFile(dorks, []byte("{target} inurl:admin\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	var query string
+	cfg := Config{Dorks: dorks, Engines: "bing", Concurrency: 1, Timeout: time.Second,
+		Stdin: strings.NewReader("kohls.com\n"), Stdout: &stdout, Stderr: io.Discard,
+		Search: func(_ context.Context, _, q string) ([]string, error) {
+			query = q
+			return []string{
+				"https://www.kohls.com/admin",
+				"https://kohls.com/login",
+				"https://other.example/admin",
+				"https://kohls.com.other.example/admin",
+			}, nil
+		},
+	}
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if query != "site:kohls.com kohls.com inurl:admin" {
+		t.Fatalf("unscoped query %q", query)
+	}
+	if got := stdout.String(); got != "https://www.kohls.com/admin\nhttps://kohls.com/login\n" {
+		t.Fatalf("out-of-scope results: %q", got)
+	}
+}
+
+func TestScopedQueryPreservesSiteOperator(t *testing.T) {
+	if got := scopedQuery("site:{target} inurl:admin", "kohls.com"); got != "site:kohls.com inurl:admin" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestScopedQueryAddsTargetWhenTemplateNamesAnotherSite(t *testing.T) {
+	if got := scopedQuery("site:other.example {target}", "kohls.com"); got != "site:kohls.com site:other.example kohls.com" {
+		t.Fatalf("query was not scoped to target: %q", got)
+	}
+}
+
+func TestBelongsToTargetIsCaseInsensitive(t *testing.T) {
+	if !belongsToTarget("https://WWW.KOHLS.COM/admin", "Kohls.com") {
+		t.Fatal("rejected in-scope URL with mixed-case host")
+	}
+}
+
 func TestPassiveProvidersRunOncePerTarget(t *testing.T) {
 	dir := t.TempDir()
 	dorks := filepath.Join(dir, "dorks.txt")

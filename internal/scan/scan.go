@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -23,6 +24,26 @@ var targetPattern = regexp.MustCompile(`(?i)^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-
 func ValidTarget(s string) bool { return len(s) <= 253 && targetPattern.MatchString(s) }
 func Synthesize(template, target string) string {
 	return strings.Join(strings.Fields(strings.ReplaceAll(strings.ReplaceAll(template, "{target}", target), "%s", target)), " ")
+}
+
+func scopedQuery(template, target string) string {
+	query := Synthesize(template, target)
+	for _, field := range strings.Fields(query) {
+		if strings.EqualFold(field, "site:"+target) {
+			return query
+		}
+	}
+	return "site:" + target + " " + query
+}
+
+func belongsToTarget(rawURL, target string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	target = strings.ToLower(target)
+	return host == target || strings.HasSuffix(host, "."+target)
 }
 
 func passive(engine string) bool { return engine == "wayback" || engine == "commoncrawl" }
@@ -87,6 +108,9 @@ func linesFromFile(path string) ([]string, error) {
 }
 
 func (s *state) add(job Job, rawURL string) error {
+	if !belongsToTarget(rawURL, job.Target) {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.seen[rawURL]; exists {
@@ -408,7 +432,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 				if passive(engine) {
 					continue
 				}
-				if err := queue(engine, Synthesize(template, target)); err != nil {
+				if err := queue(engine, scopedQuery(template, target)); err != nil {
 					return err
 				}
 			}

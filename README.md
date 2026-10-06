@@ -27,6 +27,8 @@ site:{target} inurl:admin
 site:%s ext:env
 ```
 
+If a template does not already contain `site:<target>`, the tool adds it to the search query. Regardless of what an engine returns, only URLs on the requested domain or its subdomains are written. Search engines can ignore operators or return unrelated results, so a query may yield no URLs after this check.
+
 Flags: `-l/--list`, `-d/--dorks`, `-e/--engines` (default `duckduckgo,bing`), `-c/--concurrency` (default `10`), `-p/--proxies`, `-o/--output`, `--delay`, `--timeout` (default `10s`), `--retries` (default `3`), `--json`, `-s/--silent`, `-v/--verbose`, and `--resume`.
 
 Proxy files accept `http://`, `https://`, and `socks5://` URLs, one per line. A proxy is selected for every request, including retries. `--silent` always prints raw URLs to stdout, even when `--json` writes JSON Lines to the output file. Operational messages go to stderr.
@@ -40,3 +42,5 @@ Google HTML may serve a JavaScript interstitial. Existing Custom Search JSON API
 Run the opt-in 100,000-job memory test with `DORKER_BH_STRESS=1 go test ./internal/scan -run TestHundredThousandJobsHeap -v`.
 
 Search HTML and anti-bot behavior can change without notice. A query blocked by an engine is reported as a failed job; the checkpoint retains only successful jobs. The tool never follows result links or scans discovered URLs.
+
+DuckDuckGo may return HTTP 202 with a bot challenge, including from its Lite endpoint. This is an upstream block; use `-e bing` or another provider and retry DuckDuckGo later. After upgrading from v0.1.0, start a fresh scan with `--resume=` and a new output file to discard any previously saved URLs outside the target scope.
